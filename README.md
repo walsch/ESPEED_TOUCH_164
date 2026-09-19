@@ -59,7 +59,19 @@ Spezielle Edit-Screens:
 
 - EXPO: Graph mit Triggerposition auf X und DutyCycle auf Y; relative und absolute Gesten
 - CURVE: gemeinsamer Graph fuer CURVX/CURVE; horizontales Wischen verschiebt X, vertikales Wischen verschiebt Y
-- Car-Auswahl: Tap auf eine Karte waehlt das Fahrzeug direkt und fuehrt zum Rennbildschirm zurueck; `BACK` fuehrt zum vorherigen Menu zurueck
+
+Car Menu (`SELECT CAR`):
+
+- 20 Fahrzeuge (`CAR 01` ... `CAR 20`) in einem zweizeiligen, horizontal scrollbaren Raster; Ziehen folgt dem Finger und rastet auf Spalten ein
+- Das aktive Fahrzeug ist orange umrandet
+- Tap auf eine Karte waehlt das Fahrzeug und kehrt zur aufrufenden Seite zurueck (Rennbildschirm oder Settings); `BACK` ebenso
+- Nur vollstaendig sichtbare Karten werden gezeichnet, um Zeichenartefakte am Rand zu vermeiden
+
+## Darstellung
+
+Alle Farben sind als RGB565-Palette in `display_unit.cpp` gebuendelt (`COLOR_*`): schwarzer Hintergrund, deutlich abgesetzte Panels und Rahmen, gelbe Labels, weisse Werte, Cyan/Orange als Akzente, Rot fuer `CANCEL`.
+
+Schriftgroessen (GFX `setTextSize`): Ueberschriften 3, Labels 2, Werte 3, Fussleisten 2. Die C/C++-IntelliSense ist fuer diesen Workspace in `.vscode/settings.json` aktiviert, damit die Outline-Ansicht funktioniert.
 
 ## EXPO und CURVE
 
