@@ -11,6 +11,8 @@ Touchscreen-Oberflaeche fuer das ESP32-S3 Touch AMOLED 1.64.
 - FT3168 Touch: SDA 47, SCL 48, I2C-Adresse `0x38`
 - Darstellung: Landscape ueber einen software-gedrehten Arduino_Canvas
 
+Alle Board-Details (Stromversorgung, Ladeschaltung, GPIO-Belegung, Stiftleisten, TF-Karte, IMU) stehen in [docs/HARDWARE.md](docs/HARDWARE.md); der Waveshare-Schaltplan liegt als Kopie unter `docs/`.
+
 ## Software
 
 - Arduino IDE/CLI
@@ -103,7 +105,7 @@ Zeigt den Fahrzeugnamen und vier Buttons:
 
 `VCC` im Rennbildschirm wird ueber BAT_ADC (GPIO 4, Teiler 200K/100K, Faktor 3) mit `analogReadMilliVolts` gemessen (8 Samples, alle 500 ms). Am USB liegen ca. 4.9 V an, am Akku 3.3 ... 4.2 V.
 
-Hinweise zur Hardware (aus dem Waveshare-Schaltplan): Der Akku wird ueber einen P-MOSFET (AO3401) automatisch zugeschaltet, sobald kein USB anliegt; der Buck-Regler MP1605 ist immer aktiv (EN fest an VIN), der Lader ETA6098 hat keinen Steuerpin. Ein Ein-/Ausschalten des Akkus per Software ist nicht moeglich, und es gibt keinen Tiefentladeschutz auf dem Board - der Akku sollte eine eigene Schutzschaltung haben; eine Low-Battery-Abschaltung per Software (Deep Sleep) ist noch nicht implementiert.
+Hinweise zur Hardware (aus dem Waveshare-Schaltplan): Der Akku wird ueber einen P-MOSFET (AO3401) automatisch zugeschaltet, sobald kein USB anliegt; der Buck-Regler MP1605 ist immer aktiv (EN fest an VIN), der Lader ETA6098 hat keinen Steuerpin und laedt fest mit 2 A. Der `5V`-Pin der Stiftleiste liegt auf demselben Netz wie USB-VBUS, d. h. auch bei Speisung ueber den Header wird der Akku geladen (USB und externe 5 V nicht gleichzeitig anschliessen). Ein Ein-/Ausschalten des Akkus per Software ist nicht moeglich, und es gibt keinen Tiefentladeschutz auf dem Board - der Akku sollte eine eigene Schutzschaltung haben; eine Low-Battery-Abschaltung per Software (Deep Sleep) ist noch nicht implementiert. Details in [docs/HARDWARE.md](docs/HARDWARE.md).
 
 ## Darstellung
 
