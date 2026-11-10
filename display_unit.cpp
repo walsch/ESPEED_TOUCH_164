@@ -1,7 +1,12 @@
 #include "display_unit.h"
+#include "trigger_sensor.h"
+#include "btn9990_driver.h"
 
 #include <Arduino_GFX_Library.h>
 #include <canvas/Arduino_Canvas.h>
+#define LV_CONF_INCLUDE_SIMPLE
+#include <lvgl.h>
+#include <esp_heap_caps.h>
 #include <Wire.h>
 #include <Preferences.h>
 #include <string.h>
@@ -22,17 +27,266 @@ constexpr int8_t TOUCH_SDA = 47;
 constexpr int8_t TOUCH_SCL = 48;
 // BAT_ADC: VCC through 200K/100K divider -> Vcc = 3 * Vadc (≈4.9 V on USB, 3.3..4.2 V on battery)
 constexpr uint8_t SUPPLY_ADC_PIN = 4;
-constexpr float SUPPLY_DIVIDER = 3.0f;
+constexpr uint8_t SUPPLY_DIVIDER = 3;
 constexpr uint32_t SUPPLY_SAMPLE_MS = 500;
-float supplyVoltage = 0.0f;
+constexpr uint8_t TRACK_VIN_ADC_PIN = 2;
+constexpr uint32_t TRACK_DIVIDER_LOWER_OHMS = 2200;
+constexpr uint8_t TRACK_VOLTAGE_SAMPLE_COUNT = 8;
+constexpr uint32_t TRACK_VOLTAGE_SAMPLE_MS = 1;
+constexpr uint16_t TRACK_SUPPLY_PRESENT_MV = 5500;
+uint16_t supplyVoltageMilliVolts = 0;
+uint16_t trackVoltageMilliVolts = 0;
+uint16_t displayedTrackVoltageMilliVolts = 0;
 uint32_t supplySampledAt = 0;
+uint16_t trackVoltageHistory[TRACK_VOLTAGE_SAMPLE_COUNT] = {};
+uint8_t trackVoltageHistoryCount = 0;
+uint8_t trackVoltageHistoryIndex = 0;
+uint32_t trackVoltageHistorySum = 0;
+uint32_t trackVoltageSampledAt = 0;
+bool trackVoltageWasValid = false;
+bool trackSupplyAvailable = false;
 
 Arduino_DataBus *lcdBus = new Arduino_ESP32QSPI(
     LCD_CS, LCD_SCK, LCD_D0, LCD_D1, LCD_D2, LCD_D3);
 Arduino_GFX *display = new Arduino_SH8601(
     lcdBus, LCD_RST, 0, LCD_WIDTH, LCD_HEIGHT, LCD_COLUMN_OFFSET);
-Arduino_Canvas *screen = new Arduino_Canvas(
+Arduino_Canvas *canvas = new Arduino_Canvas(
     LCD_WIDTH, LCD_HEIGHT, display, 0, 0, 1);
+
+constexpr int16_t UI_WIDTH = LCD_HEIGHT;
+constexpr int16_t UI_HEIGHT = LCD_WIDTH;
+constexpr uint32_t LVGL_BUFFER_BYTES = UI_WIDTH * UI_HEIGHT * sizeof(uint16_t);
+lv_display_t *lvDisplay = nullptr;
+lv_indev_t *lvTouch = nullptr;
+uint16_t *lvBuffer = nullptr;
+bool touchDownForLvgl = false;
+int16_t touchXForLvgl = 0;
+int16_t touchYForLvgl = 0;
+bool displayReady = false;
+DisplayMotorState motorState = DisplayMotorState::Initializing;
+DisplayMotorState displayedMotorState = DisplayMotorState::Initializing;
+uint8_t motorDutyPercent = 0;
+uint8_t displayedMotorDutyPercent = UINT8_MAX;
+
+class LvglCanvas {
+public:
+  bool begin() {
+    if (!canvas->begin()) {
+      return false;
+    }
+
+    lv_init();
+    lv_tick_set_cb(millis);
+    lvBuffer = static_cast<uint16_t *>(heap_caps_malloc(
+        LVGL_BUFFER_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (!lvBuffer) {
+      lvBuffer = static_cast<uint16_t *>(malloc(LVGL_BUFFER_BYTES));
+    }
+    if (!lvBuffer) {
+      return false;
+    }
+
+    lvDisplay = lv_display_create(UI_WIDTH, UI_HEIGHT);
+    lv_display_set_color_format(lvDisplay, LV_COLOR_FORMAT_RGB565);
+    lv_display_set_buffers(lvDisplay, lvBuffer, nullptr, LVGL_BUFFER_BYTES,
+                           LV_DISPLAY_RENDER_MODE_FULL);
+    lv_display_set_flush_cb(lvDisplay, flushDisplay);
+
+    lvTouch = lv_indev_create();
+    lv_indev_set_type(lvTouch, LV_INDEV_TYPE_POINTER);
+    lv_indev_set_read_cb(lvTouch, readLvglTouch);
+    return true;
+  }
+
+  void fillScreen(uint16_t color) {
+    lv_obj_t *root = lv_screen_active();
+    lv_obj_clean(root);
+    lv_obj_set_style_bg_color(root, toLvColor(color), 0);
+    lv_obj_set_style_bg_opa(root, LV_OPA_COVER, 0);
+    releaseLinePoints();
+  }
+
+  void fillRoundRect(int16_t x, int16_t y, int16_t w, int16_t h, int16_t radius, uint16_t color) {
+    lv_obj_t *shape = createShape(x, y, w, h, radius, color, 0, 0);
+    (void)shape;
+  }
+
+  void drawRoundRect(int16_t x, int16_t y, int16_t w, int16_t h, int16_t radius, uint16_t color) {
+    createShape(x, y, w, h, radius, 0, color, 2, true);
+  }
+
+  void fillRect(int16_t x, int16_t y, int16_t w, int16_t h, uint16_t color) {
+    createShape(x, y, w, h, 0, color, 0, 0);
+  }
+
+  void fillCircle(int16_t x, int16_t y, int16_t radius, uint16_t color) {
+    lv_obj_t *shape = createShape(x - radius, y - radius, radius * 2, radius * 2, LV_RADIUS_CIRCLE, color, 0, 0);
+    (void)shape;
+  }
+
+  void drawCircle(int16_t x, int16_t y, int16_t radius, uint16_t color) {
+    createShape(x - radius, y - radius, radius * 2, radius * 2, LV_RADIUS_CIRCLE, 0, color, 2, true);
+  }
+
+  void drawFastHLine(int16_t x, int16_t y, int16_t w, uint16_t color) {
+    fillRect(x, y, w, 2, color);
+  }
+
+  void drawFastVLine(int16_t x, int16_t y, int16_t h, uint16_t color) {
+    fillRect(x, y, 2, h, color);
+  }
+
+  void drawLine(int16_t x1, int16_t y1, int16_t x2, int16_t y2, uint16_t color) {
+    if (linePointCount >= MAX_LINE_OBJECTS) {
+      return;
+    }
+    lv_point_precise_t *points = static_cast<lv_point_precise_t *>(lv_malloc(sizeof(lv_point_precise_t) * 2));
+    if (!points) {
+      return;
+    }
+    points[0] = {x1, y1};
+    points[1] = {x2, y2};
+    linePoints[linePointCount++] = points;
+    lv_obj_t *line = lv_line_create(lv_screen_active());
+    lv_line_set_points(line, points, 2);
+    lv_obj_set_size(line, UI_WIDTH, UI_HEIGHT);
+    lv_obj_set_style_line_color(line, toLvColor(color), 0);
+    lv_obj_set_style_line_width(line, 2, 0);
+    lv_obj_set_style_line_rounded(line, false, 0);
+    lv_obj_clear_flag(line, LV_OBJ_FLAG_CLICKABLE);
+  }
+
+  void fillTriangle(int16_t x1, int16_t y1, int16_t x2, int16_t y2, int16_t x3, int16_t y3, uint16_t color) {
+    drawLine(x1, y1, x2, y2, color);
+    drawLine(x2, y2, x3, y3, color);
+    drawLine(x3, y3, x1, y1, color);
+  }
+
+  void setTextColor(uint16_t color) { textColor = color; }
+
+  void setTextSize(uint8_t size) {
+    switch (size) {
+      case 1: textFont = &lv_font_montserrat_10; break;
+      case 2: textFont = &lv_font_montserrat_16; break;
+      case 3: textFont = &lv_font_montserrat_24; break;
+      case 4: textFont = &lv_font_montserrat_32; break;
+      default: textFont = &lv_font_montserrat_48; break;
+    }
+  }
+
+  void setCursor(int16_t x, int16_t y) {
+    textX = x;
+    textY = y;
+    textLabel = nullptr;
+    textBuffer[0] = '\0';
+  }
+
+  void print(const char *text) { appendText(text); }
+  void print(char value) {
+    const char text[] = {value, '\0'};
+    appendText(text);
+  }
+  void print(int value) {
+    char text[16];
+    snprintf(text, sizeof(text), "%d", value);
+    appendText(text);
+  }
+  void print(float value, uint8_t digits) {
+    char format[8];
+    char text[24];
+    snprintf(format, sizeof(format), "%%.%uf", digits);
+    snprintf(text, sizeof(text), format, value);
+    appendText(text);
+  }
+
+  void flush() {
+    lv_timer_handler();
+  }
+
+  void setTouch(bool down, int16_t x, int16_t y) {
+    touchDownForLvgl = down;
+    touchXForLvgl = x;
+    touchYForLvgl = y;
+  }
+
+  void handleTimers() { lv_timer_handler(); }
+
+private:
+  static constexpr uint8_t MAX_LINE_OBJECTS = 128;
+  static lv_point_precise_t *linePoints[MAX_LINE_OBJECTS];
+  static uint8_t linePointCount;
+  lv_obj_t *textLabel = nullptr;
+  lv_font_t const *textFont = &lv_font_montserrat_16;
+  uint16_t textColor = 0xFFFF;
+  int16_t textX = 0;
+  int16_t textY = 0;
+  char textBuffer[128] = "";
+
+  static lv_color_t toLvColor(uint16_t color) {
+    return lv_color_make(((color >> 11) & 0x1F) * 255 / 31,
+                         ((color >> 5) & 0x3F) * 255 / 63,
+                         (color & 0x1F) * 255 / 31);
+  }
+
+  static lv_obj_t *createShape(int16_t x, int16_t y, int16_t w, int16_t h, int16_t radius,
+                               uint16_t fill, uint16_t border, uint8_t borderWidth, bool transparentFill = false) {
+    lv_obj_t *shape = lv_obj_create(lv_screen_active());
+    lv_obj_remove_style_all(shape);
+    lv_obj_set_pos(shape, x, y);
+    lv_obj_set_size(shape, w, h);
+    lv_obj_set_style_radius(shape, radius, 0);
+    lv_obj_set_style_bg_color(shape, toLvColor(fill), 0);
+    lv_obj_set_style_bg_opa(shape, transparentFill ? LV_OPA_TRANSP : LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(shape, toLvColor(border), 0);
+    lv_obj_set_style_border_width(shape, borderWidth, 0);
+    lv_obj_set_style_pad_all(shape, 0, 0);
+    lv_obj_clear_flag(shape, LV_OBJ_FLAG_CLICKABLE);
+    return shape;
+  }
+
+  void appendText(const char *text) {
+    if (!text) {
+      return;
+    }
+    const size_t used = strlen(textBuffer);
+    strncat(textBuffer, text, sizeof(textBuffer) - used - 1);
+    if (!textLabel) {
+      textLabel = lv_label_create(lv_screen_active());
+      lv_obj_set_pos(textLabel, textX, textY);
+      lv_obj_set_style_text_color(textLabel, toLvColor(textColor), 0);
+      lv_obj_set_style_text_font(textLabel, textFont, 0);
+      lv_label_set_long_mode(textLabel, LV_LABEL_LONG_MODE_CLIP);
+      lv_obj_clear_flag(textLabel, LV_OBJ_FLAG_CLICKABLE);
+    }
+    lv_label_set_text(textLabel, textBuffer);
+  }
+
+  static void releaseLinePoints() {
+    for (uint8_t i = 0; i < linePointCount; i++) {
+      lv_free(linePoints[i]);
+      linePoints[i] = nullptr;
+    }
+    linePointCount = 0;
+  }
+
+  static void flushDisplay(lv_display_t *displayDriver, const lv_area_t *area, uint8_t *pixels) {
+    (void)area;
+    canvas->draw16bitRGBBitmap(0, 0, reinterpret_cast<uint16_t *>(pixels), UI_WIDTH, UI_HEIGHT);
+    canvas->flush();
+    lv_display_flush_ready(displayDriver);
+  }
+
+  static void readLvglTouch(lv_indev_t *input, lv_indev_data_t *data) {
+    (void)input;
+    data->point.x = touchXForLvgl;
+    data->point.y = touchYForLvgl;
+    data->state = touchDownForLvgl ? LV_INDEV_STATE_PRESSED : LV_INDEV_STATE_RELEASED;
+  }
+};
+
+lv_point_precise_t *LvglCanvas::linePoints[LvglCanvas::MAX_LINE_OBJECTS] = {};
+uint8_t LvglCanvas::linePointCount = 0;
+LvglCanvas *screen = new LvglCanvas();
 
 enum class MenuPage : uint8_t {
   Status,
@@ -45,6 +299,9 @@ enum class MenuPage : uint8_t {
   CarCopyConfirm,
   CarDefaultsConfirm,
   Config,
+  VinCorrection,
+  BtnTemperatureCorrection,
+  TriggerCalibration,
   AssignSlot,
   Help,
   AllDefaultsConfirm
@@ -111,10 +368,82 @@ int16_t touchStartY = 0;
 int16_t touchLastX = 0;
 int16_t touchLastY = 0;
 float sliderRemainder = 0.0f;
-int8_t sliderDirection = 0;
+uint32_t sliderLastMs = 0;
+float sliderSpeed = 0.0f;
+constexpr float RELATIVE_MIN_GAIN = 0.05f;
+constexpr float RELATIVE_SLOW_SPEED = 240.0f;
+constexpr float RELATIVE_FULL_SPEED = 2400.0f;
+constexpr float RELATIVE_SPEED_FILTER = 0.25f;
 int16_t settingsScroll = 0;
 int16_t settingsScrollStart = 0;
 int16_t settingsTouchStartScroll = 0;
+int16_t displayedTriggerAngle = -2;
+uint32_t triggerDisplayUpdatedAt = 0;
+constexpr int16_t BTN_TEMPERATURE_INVALID = -32768;
+int16_t displayedBtnTemperatureDeciC = BTN_TEMPERATURE_INVALID;
+uint32_t btnTemperatureDisplayUpdatedAt = 0;
+constexpr int16_t TRIGGER_ANGLE_FULL = 3600;
+constexpr int16_t TRIGGER_TRAVEL_MIN = 150;
+constexpr int16_t TRIGGER_TRAVEL_MAX = 1500;
+int16_t triggerCalibrationRest = -1;
+int16_t triggerCalibrationTravel = 0;
+int16_t calibrationRestAngle = -1;
+int16_t calibrationFullAngle = -1;
+bool calibrationSaveFailed = false;
+
+int16_t wrapTriggerAngle(int32_t angle) {
+  angle %= TRIGGER_ANGLE_FULL;
+  if (angle >= TRIGGER_ANGLE_FULL / 2) {
+    angle -= TRIGGER_ANGLE_FULL;
+  } else if (angle < -TRIGGER_ANGLE_FULL / 2) {
+    angle += TRIGGER_ANGLE_FULL;
+  }
+  return angle;
+}
+
+int16_t normalizeTriggerAngle(int32_t angle) {
+  angle %= TRIGGER_ANGLE_FULL;
+  if (angle < 0) {
+    angle += TRIGGER_ANGLE_FULL;
+  }
+  return angle;
+}
+
+bool triggerCalibrationIsValid(int16_t rest, int16_t travel) {
+  const int32_t span = abs((int32_t)travel);
+  return rest >= 0 && rest < TRIGGER_ANGLE_FULL &&
+         span >= TRIGGER_TRAVEL_MIN && span <= TRIGGER_TRAVEL_MAX;
+}
+
+bool calibrationCandidateIsValid() {
+  if (calibrationRestAngle < 0 || calibrationFullAngle < 0) {
+    return false;
+  }
+  return triggerCalibrationIsValid(calibrationRestAngle,
+                                   wrapTriggerAngle(calibrationFullAngle - calibrationRestAngle));
+}
+
+bool mapTriggerAngleToPercent(int16_t angle, int16_t rest, int16_t travel,
+                              uint8_t deadbandPercent, uint8_t &percent) {
+  if (angle < 0 || angle >= TRIGGER_ANGLE_FULL || !triggerCalibrationIsValid(rest, travel)) {
+    return false;
+  }
+  int32_t position = wrapTriggerAngle(angle - rest);
+  const int32_t span = abs((int32_t)travel);
+  if (travel < 0) {
+    position = -position;
+  }
+  const int32_t deadband = (span * deadbandPercent + 50) / 100;
+  if (position <= deadband) {
+    percent = 0;
+  } else if (position >= span - deadband) {
+    percent = 100;
+  } else {
+    const int32_t activeSpan = span - 2 * deadband;
+    percent = ((position - deadband) * 100 + activeSpan / 2) / activeSpan;
+  }
+  return true;
+}
 
 // 3 columns of 148px + 4px gaps fill the 456px row edge-to-edge (same grid as car menu)
 constexpr int16_t SETTINGS_BUTTON_WIDTH = 148;
@@ -165,12 +494,29 @@ constexpr uint8_t SETTING_COUNT = sizeof(settings) / sizeof(settings[0]);
 // global (not per-car) options shown on the Config page; edited with the same Edit screen
 SettingItem configItems[] = {
     {"DBLTAP", 400, 200, 1000, 'm'},
+  {"DEADBAND", 5, 0, 20, '%'},
+  {"VINDIV", 1, 0, 1, ' '},
+  {"VCORR", 0, -500, 500, 'm'},
+  {"TCORR", 0, -2000, 2000, 'd'},
 };
 constexpr uint8_t CONFIG_COUNT = sizeof(configItems) / sizeof(configItems[0]);
+constexpr uint8_t CONFIG_CARD_COUNT = 2;
 constexpr uint8_t CONFIG_DOUBLE_TAP = 0;
+constexpr uint8_t CONFIG_DEADBAND = 1;
+constexpr uint8_t CONFIG_VIN_DIVIDER = 2;
+constexpr uint8_t CONFIG_VOLTAGE_CORRECTION = 3;
+constexpr uint8_t CONFIG_BTN_TEMPERATURE_CORRECTION = 4;
 uint8_t selectedConfig = 0;
 bool editingConfig = false;
 int16_t savedConfigValues[CONFIG_COUNT];
+int32_t vinCorrectionTargetMilliVolts = 0;
+int32_t displayedVinCorrectionIstMilliVolts = -1;
+int32_t displayedVinCorrectionTargetMilliVolts = -1;
+uint32_t vinCorrectionDisplayUpdatedAt = 0;
+int16_t btnTemperatureCorrectionTargetDeciC = 0;
+int16_t displayedBtnCorrectionIstDeciC = INT16_MIN;
+int16_t displayedBtnCorrectionTargetDeciC = INT16_MIN;
+uint32_t btnCorrectionDisplayUpdatedAt = 0;
 
 SettingItem &editItem() {
   return editingConfig ? configItems[selectedConfig] : settings[selectedSetting];
@@ -191,12 +537,31 @@ struct CarBlob {
   int16_t values[SETTING_COUNT];
   int16_t curveX;
 };
+struct TriggerCalibrationBlob {
+  int16_t rest;
+  int16_t travel;
+};
 constexpr uint16_t PROFILE_VERSION = 1;
 constexpr uint32_t PERSIST_DELAY_MS = 2000;
 Preferences prefs;
+bool preferencesReady = false;
 CarBlob savedBlobs[CAR_COUNT];
 uint8_t savedSelectedCar = 0;
 uint32_t pendingSaveAt = 0;
+
+bool saveTriggerCalibration(int16_t rest, int16_t travel) {
+  if (!preferencesReady || !triggerCalibrationIsValid(rest, travel)) {
+    return false;
+  }
+  const TriggerCalibrationBlob calibration = {rest, travel};
+  if (prefs.putBytes("trCal", &calibration, sizeof(calibration)) != sizeof(calibration)) {
+    return false;
+  }
+  TriggerCalibrationBlob stored = {};
+  return prefs.getBytesLength("trCal") == sizeof(stored) &&
+         prefs.getBytes("trCal", &stored, sizeof(stored)) == sizeof(stored) &&
+         stored.rest == rest && stored.travel == travel;
+}
 
 void storeCurrentCar() {
   for (uint8_t i = 0; i < SETTING_COUNT; i++) {
@@ -277,7 +642,7 @@ void initCars() {
     resetCarToDefaults(car);
   }
 
-  prefs.begin("espeed", false);
+  preferencesReady = prefs.begin("espeed", false);
   const bool valid = prefs.getUShort("ver", 0) == PROFILE_VERSION;
   char key[8];
   for (uint8_t car = 0; car < CAR_COUNT; car++) {
@@ -310,6 +675,29 @@ void initCars() {
     snprintf(slotKey, sizeof(slotKey), "slot%u", i);
     slotSetting[i] = min(prefs.getUChar(slotKey, slotSetting[i]), (uint8_t)(SETTING_COUNT - 1));
     savedSlotSetting[i] = slotSetting[i];
+  }
+  TriggerCalibrationBlob calibration = {};
+  const bool hasCalibration = preferencesReady &&
+      prefs.getBytesLength("trCal") == sizeof(calibration) &&
+      prefs.getBytes("trCal", &calibration, sizeof(calibration)) == sizeof(calibration) &&
+      triggerCalibrationIsValid(calibration.rest, calibration.travel);
+  if (hasCalibration) {
+    triggerCalibrationRest = calibration.rest;
+    triggerCalibrationTravel = calibration.travel;
+  } else {
+    triggerCalibrationRest = prefs.getShort("tRest", -1);
+    triggerCalibrationTravel = prefs.getShort("tSpan", 0);
+    if (triggerCalibrationIsValid(triggerCalibrationRest, triggerCalibrationTravel)) {
+      calibration = {triggerCalibrationRest, triggerCalibrationTravel};
+      prefs.putBytes("trCal", &calibration, sizeof(calibration));
+    } else {
+      triggerCalibrationRest = -1;
+      triggerCalibrationTravel = 0;
+    }
+  }
+  if (!triggerCalibrationIsValid(triggerCalibrationRest, triggerCalibrationTravel)) {
+    triggerCalibrationRest = -1;
+    triggerCalibrationTravel = 0;
   }
 }
 // GFX text size is integer only: size 3 = 18px/char -> 144px for 8 chars; 3 columns of 148px fill 456px
@@ -420,6 +808,58 @@ void drawHeader(const char *title) {
   screen->drawFastHLine(20, 46, 416, COLOR_ACCENT);
 }
 
+const char *motorStateLabel(DisplayMotorState state) {
+  switch (state) {
+    case DisplayMotorState::DriverError: return "BTN ERROR";
+    case DisplayMotorState::NoVin: return "NO VIN";
+    case DisplayMotorState::NoSensor: return "NO SENSOR";
+    case DisplayMotorState::CalibrationRequired: return "CAL REQUIRED";
+    case DisplayMotorState::LeaveBrake: return "RELEASE TRIGGER";
+    case DisplayMotorState::Braking: return "BRAKE";
+    case DisplayMotorState::Driving: return "DRIVE";
+    case DisplayMotorState::DrivingLowVin: return "DRIVE LOW VIN";
+    case DisplayMotorState::NotRaceScreen: return "RACE SCREEN";
+    default: return "INIT";
+  }
+}
+
+uint16_t motorStateColor(DisplayMotorState state) {
+  if (state == DisplayMotorState::Driving) {
+    return COLOR_ACCENT;
+  }
+  if (state == DisplayMotorState::DrivingLowVin) {
+    return COLOR_DANGER;
+  }
+  if (state == DisplayMotorState::Braking) {
+    return COLOR_ACCENT_WARM;
+  }
+  if (state == DisplayMotorState::DriverError || state == DisplayMotorState::NoVin ||
+      state == DisplayMotorState::NoSensor || state == DisplayMotorState::CalibrationRequired) {
+    return COLOR_DANGER;
+  }
+  return COLOR_BORDER;
+}
+
+void drawMotorStatusBadge() {
+  const DisplayMotorState state = __atomic_load_n(&motorState, __ATOMIC_ACQUIRE);
+  const uint8_t duty = __atomic_load_n(&motorDutyPercent, __ATOMIC_RELAXED);
+  char label[24];
+  if (state == DisplayMotorState::Driving || state == DisplayMotorState::DrivingLowVin ||
+      state == DisplayMotorState::Braking) {
+    snprintf(label, sizeof(label), "%s %u%%", motorStateLabel(state), duty);
+  } else {
+    snprintf(label, sizeof(label), "%s", motorStateLabel(state));
+  }
+  screen->fillRoundRect(188, 6, 122, 34, 8, COLOR_PANEL);
+  screen->drawRoundRect(188, 6, 122, 34, 8, motorStateColor(state));
+  screen->setTextColor(COLOR_TEXT);
+  screen->setTextSize(1);
+  screen->setCursor(249 - (strlen(label) * 6) / 2, 19);
+  screen->print(label);
+  displayedMotorState = state;
+  displayedMotorDutyPercent = duty;
+}
+
 void printSettingValue(const SettingItem &item, int16_t x, int16_t y);
 
 void statusCardRect(uint8_t card, int16_t &x, int16_t &y) {
@@ -440,16 +880,82 @@ int8_t statusCardAt(int16_t x, int16_t y) {
   return -1;
 }
 
-void printSupplyVoltage() {
+void printTrackVoltage() {
+  char text[16];
+  snprintf(text, sizeof(text), "%u.%02u V", displayedTrackVoltageMilliVolts / 1000,
+           (displayedTrackVoltageMilliVolts % 1000) / 10);
+  screen->setTextColor(COLOR_TEXT);
+  screen->setTextSize(2);
+  screen->setCursor(332 - strlen(text) * 4, 244);
+  screen->print(text);
+}
+
+bool currentBtnTemperatureDeciC(int16_t *temperatureDeciC) {
+  if (!temperatureDeciC || !btn9990GetTemperatureDeciC(temperatureDeciC)) {
+    return false;
+  }
+  *temperatureDeciC += configItems[CONFIG_BTN_TEMPERATURE_CORRECTION].value;
+  return true;
+}
+
+void formatTemperatureDeciC(int16_t temperatureDeciC, char *text, size_t textSize) {
+  const int16_t magnitude = abs(temperatureDeciC);
+  snprintf(text, textSize, "%s%d.%d C", temperatureDeciC < 0 ? "-" : "",
+           magnitude / 10, magnitude % 10);
+}
+
+void printBtnTemperature() {
+  char text[16];
+  int16_t temperatureDeciC;
+  if (!currentBtnTemperatureDeciC(&temperatureDeciC)) {
+    displayedBtnTemperatureDeciC = BTN_TEMPERATURE_INVALID;
+    strcpy(text, "--.- C");
+  } else {
+    displayedBtnTemperatureDeciC = temperatureDeciC;
+    formatTemperatureDeciC(temperatureDeciC, text, sizeof(text));
+  }
+  screen->setTextColor(COLOR_TEXT);
+  screen->setTextSize(2);
+  screen->setCursor(192 - strlen(text) * 4, 244);
+  screen->print(text);
+}
+
+int16_t currentTriggerAngle() {
+  int16_t angle = -1;
+  triggerSensorGetAngle(&angle);
+  return angle;
+}
+
+void printAngleValue(int16_t angle) {
+  if (angle < 0) {
+    screen->print("--");
+  } else {
+    screen->print(angle / 10);
+    screen->print('.');
+    screen->print(angle % 10);
+    screen->print(" deg");
+  }
+}
+
+void printTriggerPercent() {
+  const int16_t angle = currentTriggerAngle();
+  displayedTriggerAngle = angle;
   screen->setTextColor(COLOR_TEXT);
   screen->setTextSize(3);
-  screen->setCursor(300, 240);
-  screen->print(supplyVoltage, 2);
-  screen->print(" V");
+  screen->setCursor(38, 240);
+  uint8_t percent;
+  if (mapTriggerAngleToPercent(angle, triggerCalibrationRest, triggerCalibrationTravel,
+                               configItems[CONFIG_DEADBAND].value, percent)) {
+    screen->print(percent);
+    screen->print('%');
+  } else {
+    screen->print("--%");
+  }
 }
 
 void drawStatusPage() {
   drawHeader("ESPEED32");
+  drawMotorStatusBadge();
   screen->fillRoundRect(322, 6, 120, 34, 8, COLOR_PANEL);
   screen->drawRoundRect(322, 6, 120, 34, 8, COLOR_ACCENT);
   screen->setTextColor(COLOR_TEXT);
@@ -484,13 +990,15 @@ void drawStatusPage() {
   screen->setTextSize(2);
   screen->setCursor(38, 218);
   screen->print("TRIGGER");
-  screen->setCursor(300, 218);
-  screen->print("VCC");
+  screen->setCursor(180, 218);
+  screen->print("BTN");
+  screen->setCursor(320, 218);
+  screen->print("VIN");
   screen->setTextColor(COLOR_TEXT);
   screen->setTextSize(3);
-  screen->setCursor(38, 240);
-  screen->print("0%");
-  printSupplyVoltage();
+  printTriggerPercent();
+  printBtnTemperature();
+  printTrackVoltage();
 }
 
 void printSettingValue(const SettingItem &item, int16_t x, int16_t y) {
@@ -499,6 +1007,8 @@ void printSettingValue(const SettingItem &item, int16_t x, int16_t y) {
   screen->setCursor(x, y);
   if (item.name[0] == 'B' && item.name[1] == 'Y') {
     screen->print(item.value ? "ON" : "OFF");
+  } else if (strcmp(item.name, "VINDIV") == 0) {
+    screen->print(item.value ? "15K" : "10K");
   } else {
     screen->print(item.value);
     if (item.unit != ' ') {
@@ -1005,17 +1515,32 @@ void drawConfigPage() {
   screen->print("BACK");
 
   // config cards use the top grid row only; action buttons sit below
-  for (uint8_t index = 0; index < CONFIG_COUNT; index++) {
+  for (uint8_t index = 0; index < CONFIG_CARD_COUNT; index++) {
     const int16_t x = SETTINGS_GRID_LEFT + index * SETTINGS_COLUMN_STEP;
     const int16_t y = 56;
     screen->fillRoundRect(x, y, SETTINGS_BUTTON_WIDTH, SETTINGS_BUTTON_HEIGHT, 12, COLOR_PANEL);
     screen->drawRoundRect(x, y, SETTINGS_BUTTON_WIDTH, SETTINGS_BUTTON_HEIGHT, 12, COLOR_BORDER);
     screen->setTextColor(COLOR_LABEL);
-    screen->setTextSize(3);
+    screen->setTextSize(strlen(configItems[index].name) > 6 ? 2 : 3);
     screen->setCursor(x + 12, y + 7);
     screen->print(configItems[index].name);
     printSettingValue(configItems[index], x + 12, y + 43);
   }
+
+  screen->fillRoundRect(20, 150, 132, 34, 8, COLOR_PANEL);
+  screen->drawRoundRect(20, 150, 132, 34, 8, COLOR_ACCENT_WARM);
+  screen->fillRoundRect(162, 150, 132, 34, 8, COLOR_PANEL);
+  screen->drawRoundRect(162, 150, 132, 34, 8, COLOR_ACCENT);
+  screen->fillRoundRect(304, 150, 132, 34, 8, COLOR_PANEL);
+  screen->drawRoundRect(304, 150, 132, 34, 8, COLOR_ACCENT_WARM);
+  screen->setTextColor(COLOR_TEXT);
+  screen->setTextSize(2);
+  screen->setCursor(32, 159);
+  screen->print("VIN CORR");
+  screen->setCursor(176, 159);
+  screen->print("BTN TEMP");
+  screen->setCursor(326, 159);
+  screen->print("TRIGGER CAL");
 
   screen->fillRoundRect(20, 196, 198, 66, 12, COLOR_PANEL);
   screen->drawRoundRect(20, 196, 198, 66, 12, COLOR_LABEL);
@@ -1027,6 +1552,278 @@ void drawConfigPage() {
   screen->print("HELP");
   screen->setCursor(238 + (198 - 8 * 18) / 2, 217);
   screen->print("DEFAULTS");
+}
+
+void printVinCalibrationVoltage(int32_t milliVolts, int16_t centerX) {
+  const int32_t value = max((int32_t)0, milliVolts);
+  char text[16];
+  snprintf(text, sizeof(text), "%ld.%02ld V", (long)(value / 1000),
+           (long)((value % 1000) / 10));
+  screen->setTextColor(COLOR_TEXT);
+  screen->setTextSize(3);
+  screen->setCursor(centerX - strlen(text) * 9, 88);
+  screen->print(text);
+}
+
+void drawVinCorrectionPage() {
+  drawHeader("VIN CORRECTION");
+  screen->fillRoundRect(232, 6, 100, 34, 8, COLOR_PANEL);
+  screen->drawRoundRect(232, 6, 100, 34, 8, COLOR_LABEL);
+  screen->fillRoundRect(342, 6, 100, 34, 8, COLOR_PANEL);
+  screen->drawRoundRect(342, 6, 100, 34, 8,
+                        trackVoltageWasValid ? COLOR_ACCENT : COLOR_BORDER);
+  screen->setTextColor(COLOR_TEXT);
+  screen->setTextSize(2);
+  screen->setCursor(254, 15);
+  screen->print("BACK");
+  screen->setCursor(366, 15);
+  screen->print("SAVE");
+
+  const int32_t ist = __atomic_load_n(&trackVoltageMilliVolts, __ATOMIC_RELAXED);
+  displayedVinCorrectionIstMilliVolts = ist;
+  displayedVinCorrectionTargetMilliVolts = vinCorrectionTargetMilliVolts;
+  screen->setTextColor(COLOR_LABEL);
+  screen->setTextSize(2);
+  screen->setCursor(110, 61);
+  screen->print("IST");
+  screen->setCursor(318, 61);
+  screen->print("SOLL");
+  printVinCalibrationVoltage(ist, 120);
+  printVinCalibrationVoltage(vinCorrectionTargetMilliVolts, 336);
+
+  screen->fillRoundRect(20, 130, 416, 40, 8, COLOR_PANEL);
+  screen->drawRoundRect(20, 130, 416, 40, 8, COLOR_ACCENT_WARM);
+  screen->setTextColor(COLOR_TEXT);
+  screen->setTextSize(2);
+  screen->setCursor(132, 141);
+  screen->print("VINDIV  ");
+  screen->print(configItems[CONFIG_VIN_DIVIDER].value ? "15K / 2.2K" : "10K / 2.2K");
+
+  const int16_t buttonX[] = {20, 124, 228, 332};
+  const char *buttonText[] = {"-100 mV", "-10 mV", "+10 mV", "+100 mV"};
+  for (uint8_t index = 0; index < 4; index++) {
+    screen->fillRoundRect(buttonX[index], 184, 96, 52, 8, COLOR_PANEL);
+    screen->drawRoundRect(buttonX[index], 184, 96, 52, 8, COLOR_BORDER);
+    screen->setTextColor(COLOR_TEXT);
+    screen->setTextSize(1);
+    screen->setCursor(buttonX[index] + (96 - strlen(buttonText[index]) * 6) / 2, 205);
+    screen->print(buttonText[index]);
+  }
+
+  screen->setTextColor(COLOR_LABEL);
+  screen->setTextSize(2);
+  screen->setCursor(120, 252);
+  screen->print("CORR ");
+  screen->print(configItems[CONFIG_VOLTAGE_CORRECTION].value);
+  screen->print(" mV");
+}
+
+void drawCurrentPage();
+
+void updateVinCorrectionPage() {
+  if (currentPage != MenuPage::VinCorrection || welcomeVisible) {
+    return;
+  }
+  const uint32_t now = millis();
+  if (now - vinCorrectionDisplayUpdatedAt < 100) {
+    return;
+  }
+  vinCorrectionDisplayUpdatedAt = now;
+  const int32_t ist = __atomic_load_n(&trackVoltageMilliVolts, __ATOMIC_RELAXED);
+  if (abs(ist - displayedVinCorrectionIstMilliVolts) >= 10 ||
+      vinCorrectionTargetMilliVolts != displayedVinCorrectionTargetMilliVolts) {
+    drawCurrentPage();
+  }
+}
+
+void printBtnCorrectionTemperature(int16_t temperatureDeciC, int16_t centerX) {
+  char text[16];
+  formatTemperatureDeciC(temperatureDeciC, text, sizeof(text));
+  screen->setTextColor(COLOR_TEXT);
+  screen->setTextSize(3);
+  screen->setCursor(centerX - strlen(text) * 9, 88);
+  screen->print(text);
+}
+
+void drawBtnTemperatureCorrectionPage() {
+  drawHeader("BTN TEMP CAL");
+  int16_t ist = 0;
+  const bool valid = currentBtnTemperatureDeciC(&ist);
+  screen->fillRoundRect(232, 6, 100, 34, 8, COLOR_PANEL);
+  screen->drawRoundRect(232, 6, 100, 34, 8, COLOR_LABEL);
+  screen->fillRoundRect(342, 6, 100, 34, 8, COLOR_PANEL);
+  screen->drawRoundRect(342, 6, 100, 34, 8,
+                        valid ? COLOR_ACCENT : COLOR_BORDER);
+  screen->setTextColor(COLOR_TEXT);
+  screen->setTextSize(2);
+  screen->setCursor(254, 15);
+  screen->print("BACK");
+  screen->setCursor(366, 15);
+  screen->print("SAVE");
+
+  displayedBtnCorrectionIstDeciC = valid ? ist : INT16_MIN;
+  displayedBtnCorrectionTargetDeciC = btnTemperatureCorrectionTargetDeciC;
+  screen->setTextColor(COLOR_LABEL);
+  screen->setTextSize(2);
+  screen->setCursor(110, 61);
+  screen->print("IST");
+  screen->setCursor(318, 61);
+  screen->print("SOLL");
+  if (valid) {
+    printBtnCorrectionTemperature(ist, 120);
+  } else {
+    screen->setTextColor(COLOR_TEXT);
+    screen->setTextSize(3);
+    screen->setCursor(84, 88);
+    screen->print("--.- C");
+  }
+  printBtnCorrectionTemperature(btnTemperatureCorrectionTargetDeciC, 336);
+
+  screen->fillRoundRect(20, 130, 416, 40, 8, COLOR_PANEL);
+  screen->drawRoundRect(20, 130, 416, 40, 8, COLOR_BORDER);
+  screen->setTextColor(COLOR_LABEL);
+  screen->setTextSize(2);
+  screen->setCursor(144, 141);
+  screen->print("OUTPUT MUST BE OFF");
+
+  const int16_t buttonX[] = {20, 90, 160, 230, 300, 370};
+  const char *buttonText[] = {"-10 C", "-1 C", "-0.1 C", "+0.1 C", "+1 C", "+10 C"};
+  for (uint8_t index = 0; index < 6; index++) {
+    screen->fillRoundRect(buttonX[index], 184, 64, 52, 8, COLOR_PANEL);
+    screen->drawRoundRect(buttonX[index], 184, 64, 52, 8, COLOR_BORDER);
+    screen->setTextColor(COLOR_TEXT);
+    screen->setTextSize(1);
+    screen->setCursor(buttonX[index] + (64 - strlen(buttonText[index]) * 6) / 2, 205);
+    screen->print(buttonText[index]);
+  }
+
+  screen->setTextColor(COLOR_LABEL);
+  screen->setTextSize(1);
+  uint16_t senseMilliVolts;
+  screen->setCursor(24, 252);
+  screen->print("IS ");
+  if (btn9990GetSenseMilliVolts(&senseMilliVolts)) {
+    screen->print(senseMilliVolts);
+    screen->print(" mV");
+  } else {
+    screen->print("-- mV");
+  }
+  char correctionText[16];
+  formatTemperatureDeciC(configItems[CONFIG_BTN_TEMPERATURE_CORRECTION].value,
+                         correctionText, sizeof(correctionText));
+  screen->setCursor(320, 252);
+  screen->print("CORR ");
+  screen->print(correctionText);
+}
+
+void updateBtnTemperatureCorrectionPage() {
+  if (currentPage != MenuPage::BtnTemperatureCorrection || welcomeVisible) {
+    return;
+  }
+  const uint32_t now = millis();
+  if (now - btnCorrectionDisplayUpdatedAt < 200) {
+    return;
+  }
+  btnCorrectionDisplayUpdatedAt = now;
+  int16_t ist = 0;
+  const int16_t current = currentBtnTemperatureDeciC(&ist) ? ist : INT16_MIN;
+  if (current != displayedBtnCorrectionIstDeciC ||
+      btnTemperatureCorrectionTargetDeciC != displayedBtnCorrectionTargetDeciC) {
+    drawCurrentPage();
+  }
+}
+
+bool currentMappedTriggerPercent(uint8_t &percent) {
+  int16_t rest = triggerCalibrationRest;
+  int16_t travel = triggerCalibrationTravel;
+  if (calibrationRestAngle >= 0 || calibrationFullAngle >= 0) {
+    if (!calibrationCandidateIsValid()) {
+      return false;
+    }
+    rest = calibrationRestAngle;
+    travel = wrapTriggerAngle(calibrationFullAngle - calibrationRestAngle);
+  }
+  return mapTriggerAngleToPercent(currentTriggerAngle(), rest, travel,
+                                  configItems[CONFIG_DEADBAND].value, percent);
+}
+
+void drawTriggerCalibrationPage() {
+  drawHeader("TRIGGER CAL");
+  screen->fillRoundRect(232, 6, 100, 34, 8, COLOR_PANEL);
+  screen->drawRoundRect(232, 6, 100, 34, 8, COLOR_LABEL);
+  screen->fillRoundRect(342, 6, 100, 34, 8, COLOR_PANEL);
+  screen->drawRoundRect(342, 6, 100, 34, 8,
+                        calibrationCandidateIsValid() ? COLOR_ACCENT : COLOR_BORDER);
+  screen->setTextColor(COLOR_TEXT);
+  screen->setTextSize(2);
+  screen->setCursor(254, 15);
+  screen->print("BACK");
+  screen->setCursor(366, 15);
+  screen->print("SAVE");
+
+  const int16_t angle = currentTriggerAngle();
+  displayedTriggerAngle = angle;
+  screen->setTextColor(COLOR_LABEL);
+  screen->setTextSize(2);
+  screen->setCursor(24, 64);
+  screen->print("ANGLE");
+  screen->setTextColor(COLOR_TEXT);
+  screen->setCursor(124, 64);
+  if (angle < 0) {
+    screen->print("NO SIGNAL");
+  } else {
+    printAngleValue(angle);
+  }
+
+  screen->setTextColor(COLOR_LABEL);
+  screen->setCursor(24, 101);
+  screen->print("OUTPUT");
+  screen->setTextColor(COLOR_TEXT);
+  screen->setTextSize(4);
+  screen->setCursor(160, 88);
+  uint8_t percent;
+  if (currentMappedTriggerPercent(percent)) {
+    screen->print(percent);
+  } else {
+    screen->print("--");
+  }
+  screen->print('%');
+
+  screen->setTextColor(COLOR_LABEL);
+  screen->setTextSize(2);
+  screen->setCursor(24, 151);
+  screen->print("REST ");
+  printAngleValue(calibrationRestAngle);
+  screen->setCursor(244, 151);
+  screen->print("FULL ");
+  printAngleValue(calibrationFullAngle);
+
+  screen->fillRoundRect(20, 184, 198, 78, 10, COLOR_PANEL);
+  screen->drawRoundRect(20, 184, 198, 78, 10,
+                        calibrationRestAngle >= 0 ? COLOR_ACCENT_WARM : COLOR_BORDER);
+  screen->fillRoundRect(238, 184, 198, 78, 10, COLOR_PANEL);
+  screen->drawRoundRect(238, 184, 198, 78, 10,
+                        calibrationFullAngle >= 0 ? COLOR_ACCENT_WARM : COLOR_BORDER);
+  screen->setTextColor(COLOR_TEXT);
+  screen->setTextSize(2);
+  screen->setCursor(72, 196);
+  screen->print("SET 0%");
+  screen->setCursor(267, 196);
+  screen->print("SET 100%");
+  screen->setTextColor(COLOR_LABEL);
+  screen->setCursor(35, 229);
+  printAngleValue(calibrationRestAngle);
+  screen->setCursor(255, 229);
+  printAngleValue(calibrationFullAngle);
+  screen->setTextSize(1);
+  screen->setCursor(114, 268);
+  if (calibrationSaveFailed) {
+    screen->setTextColor(COLOR_DANGER);
+    screen->setCursor(178, 268);
+    screen->print("SAVE FAILED");
+  } else {
+    screen->print("RELEASE AT 0%; PULL FULL AT 100%");
+  }
 }
 
 void drawAllDefaultsConfirmPage() {
@@ -1176,6 +1973,12 @@ void drawCurrentPage() {
     drawEditPage();
   } else if (currentPage == MenuPage::Config) {
     drawConfigPage();
+  } else if (currentPage == MenuPage::VinCorrection) {
+    drawVinCorrectionPage();
+  } else if (currentPage == MenuPage::BtnTemperatureCorrection) {
+    drawBtnTemperatureCorrectionPage();
+  } else if (currentPage == MenuPage::TriggerCalibration) {
+    drawTriggerCalibrationPage();
   } else if (currentPage == MenuPage::Help) {
     drawHelpPage();
   } else if (currentPage == MenuPage::AllDefaultsConfirm) {
@@ -1410,6 +2213,35 @@ void handleTouch(int16_t x, int16_t y) {
       drawCurrentPage();
       return;
     }
+    if (y >= 150 && y < 184) {
+      if (x >= 20 && x < 152) {
+        vinCorrectionTargetMilliVolts = __atomic_load_n(&trackVoltageMilliVolts, __ATOMIC_RELAXED);
+        vinCorrectionDisplayUpdatedAt = 0;
+        currentPage = MenuPage::VinCorrection;
+        drawCurrentPage();
+        return;
+      }
+      if (x >= 162 && x < 294) {
+        int16_t temperatureDeciC;
+        btnTemperatureCorrectionTargetDeciC = currentBtnTemperatureDeciC(&temperatureDeciC)
+                                                  ? temperatureDeciC
+                                                  : 0;
+        btnCorrectionDisplayUpdatedAt = 0;
+        currentPage = MenuPage::BtnTemperatureCorrection;
+        drawCurrentPage();
+        return;
+      }
+      if (x >= 304 && x < 436) {
+        calibrationRestAngle = triggerCalibrationRest;
+        calibrationFullAngle = triggerCalibrationIsValid(triggerCalibrationRest, triggerCalibrationTravel)
+                                   ? normalizeTriggerAngle(triggerCalibrationRest + triggerCalibrationTravel)
+                                   : -1;
+        calibrationSaveFailed = false;
+        currentPage = MenuPage::TriggerCalibration;
+        drawCurrentPage();
+        return;
+      }
+    }
     if (y >= 196 && y < 262 && x >= 20 && x < 218) {
       helpPage = 0;
       currentPage = MenuPage::Help;
@@ -1422,7 +2254,7 @@ void handleTouch(int16_t x, int16_t y) {
       drawCurrentPage();
       return;
     }
-    for (uint8_t index = 0; index < CONFIG_COUNT; index++) {
+    for (uint8_t index = 0; index < CONFIG_CARD_COUNT; index++) {
       const int16_t cardX = SETTINGS_GRID_LEFT + index * SETTINGS_COLUMN_STEP;
       const int16_t cardY = 56;
       if (x >= cardX && x < cardX + SETTINGS_BUTTON_WIDTH &&
@@ -1434,6 +2266,117 @@ void handleTouch(int16_t x, int16_t y) {
         drawCurrentPage();
         break;
       }
+    }
+    return;
+  }
+
+  if (currentPage == MenuPage::VinCorrection) {
+    if (y < 50 && x >= 232 && x < 332) {
+      currentPage = MenuPage::Config;
+      drawCurrentPage();
+    } else if (y < 50 && x >= 342 && x < 442) {
+      if (trackVoltageWasValid) {
+        const int32_t ist = __atomic_load_n(&trackVoltageMilliVolts, __ATOMIC_RELAXED);
+        (void)ist;
+        const int32_t correction = configItems[CONFIG_VOLTAGE_CORRECTION].value +
+                                   vinCorrectionTargetMilliVolts - ist;
+        configItems[CONFIG_VOLTAGE_CORRECTION].value = constrain(correction, -500L, 500L);
+        pendingSaveAt = millis() + PERSIST_DELAY_MS;
+        currentPage = MenuPage::Config;
+        drawCurrentPage();
+      }
+    } else if (y >= 130 && y < 172 && x >= 20 && x < 436) {
+      configItems[CONFIG_VIN_DIVIDER].value = !configItems[CONFIG_VIN_DIVIDER].value;
+      memset(trackVoltageHistory, 0, sizeof(trackVoltageHistory));
+      trackVoltageHistoryCount = 0;
+      trackVoltageHistoryIndex = 0;
+      trackVoltageHistorySum = 0;
+      trackVoltageWasValid = false;
+      trackVoltageSampledAt = 0;
+      pendingSaveAt = millis() + PERSIST_DELAY_MS;
+      drawCurrentPage();
+    } else if (y >= 184 && y < 236 && x >= 20 && x < 436) {
+      int32_t delta = 0;
+      if (x < 122) {
+        delta = -100;
+      } else if (x < 226) {
+        delta = -10;
+      } else if (x < 330) {
+        delta = 10;
+      } else {
+        delta = 100;
+      }
+      vinCorrectionTargetMilliVolts = constrain(vinCorrectionTargetMilliVolts + delta, 0L, 30000L);
+      drawCurrentPage();
+    }
+    return;
+  }
+
+  if (currentPage == MenuPage::BtnTemperatureCorrection) {
+    if (y < 50 && x >= 232 && x < 332) {
+      currentPage = MenuPage::Config;
+      drawCurrentPage();
+    } else if (y < 50 && x >= 342 && x < 442) {
+      int16_t ist;
+      if (currentBtnTemperatureDeciC(&ist)) {
+        const int32_t correction = configItems[CONFIG_BTN_TEMPERATURE_CORRECTION].value +
+                                   btnTemperatureCorrectionTargetDeciC - ist;
+        configItems[CONFIG_BTN_TEMPERATURE_CORRECTION].value = constrain(correction, -2000L, 2000L);
+        pendingSaveAt = millis() + PERSIST_DELAY_MS;
+        currentPage = MenuPage::Config;
+        drawCurrentPage();
+      }
+    } else if (y >= 184 && y < 236 && x >= 20 && x < 436) {
+      int16_t delta = 0;
+      if (x < 90) {
+        delta = -100;
+      } else if (x < 160) {
+        delta = -10;
+      } else if (x < 230) {
+        delta = -1;
+      } else if (x < 300) {
+        delta = 1;
+      } else if (x < 370) {
+        delta = 10;
+      } else {
+        delta = 100;
+      }
+      btnTemperatureCorrectionTargetDeciC = constrain(
+          (int32_t)btnTemperatureCorrectionTargetDeciC + delta, -1000L, 2000L);
+      drawCurrentPage();
+    }
+    return;
+  }
+
+  if (currentPage == MenuPage::TriggerCalibration) {
+    if (y < 50 && x >= 232 && x < 332) {
+      currentPage = MenuPage::Config;
+      drawCurrentPage();
+    } else if (y < 50 && x >= 342 && x < 442) {
+      if (calibrationCandidateIsValid()) {
+        const int16_t travel = wrapTriggerAngle(calibrationFullAngle - calibrationRestAngle);
+        calibrationSaveFailed = !saveTriggerCalibration(calibrationRestAngle, travel);
+        if (!calibrationSaveFailed) {
+          triggerCalibrationRest = calibrationRestAngle;
+          triggerCalibrationTravel = travel;
+          currentPage = MenuPage::Config;
+        }
+        drawCurrentPage();
+      }
+    } else if (y >= 184 && y < 262) {
+      int16_t angle;
+      if (!triggerSensorGetAngle(&angle)) {
+        return;
+      }
+      if (x >= 20 && x < 218) {
+        calibrationRestAngle = angle;
+      } else if (x >= 238 && x < 436) {
+        calibrationFullAngle = angle;
+      } else {
+        return;
+      }
+      calibrationSaveFailed = false;
+      drawCurrentPage();
     }
     return;
   }
@@ -1627,22 +2570,27 @@ void handleSwipe(int16_t startX, int16_t startY, int16_t endX, int16_t endY) {
   }
 }
 
-void updateValueFromSlider(int16_t deltaX) {
+// relative change with velocity gain: up to RELATIVE_SLOW_SPEED px/s a swipe over the full 416 px moves
+// RELATIVE_MIN_GAIN of the range, the gain grows linearly and reaches 100 % at RELATIVE_FULL_SPEED px/s
+void applyRelativeDelta(SettingItem &item, int16_t delta) {
   const float sliderTravel = 416.0f;
-  SettingItem &item = editItem();
+  if (delta == 0) {
+    return;
+  }
+  // the touch controller is polled faster than it reports, so time only between real position changes
+  const uint32_t now = millis();
+  uint32_t elapsed = now - sliderLastMs;
+  sliderLastMs = now;
+  if (elapsed == 0) {
+    elapsed = 1;
+  }
+  const float speed = (abs(delta) * 1000.0f) / elapsed;
+  sliderSpeed += (speed - sliderSpeed) * RELATIVE_SPEED_FILTER;
+  const float gain = constrain(RELATIVE_MIN_GAIN + (sliderSpeed - RELATIVE_SLOW_SPEED) * (1.0f - RELATIVE_MIN_GAIN) /
+                               (RELATIVE_FULL_SPEED - RELATIVE_SLOW_SPEED), RELATIVE_MIN_GAIN, 1.0f);
   const int16_t valueRange = item.maximum - item.minimum;
-  const int8_t direction = deltaX > 0 ? 1 : -1;
-  if (sliderDirection != 0 && direction != sliderDirection) {
-    sliderRemainder = 0.0f;
-  }
-  sliderDirection = direction;
-  sliderRemainder += ((float)deltaX * valueRange) / sliderTravel;
-  int16_t valueDelta = (int16_t)sliderRemainder;
-  if (valueDelta > 1) {
-    valueDelta = 1;
-  } else if (valueDelta < -1) {
-    valueDelta = -1;
-  }
+  sliderRemainder += ((float)delta * valueRange * gain) / sliderTravel;
+  const int16_t valueDelta = (int16_t)sliderRemainder;
   if (valueDelta != 0) {
     item.value = constrain(item.value + valueDelta, item.minimum, item.maximum);
     sliderRemainder -= valueDelta;
@@ -1650,27 +2598,12 @@ void updateValueFromSlider(int16_t deltaX) {
   }
 }
 
+void updateValueFromSlider(int16_t deltaX) {
+  applyRelativeDelta(editItem(), deltaX);
+}
+
 void updateSettingFromGesture(uint8_t settingIndex, int16_t delta) {
-  const float sliderTravel = 416.0f;
-  SettingItem &item = settings[settingIndex];
-  const int16_t valueRange = item.maximum - item.minimum;
-  const int8_t direction = delta > 0 ? 1 : -1;
-  if (sliderDirection != 0 && direction != sliderDirection) {
-    sliderRemainder = 0.0f;
-  }
-  sliderDirection = direction;
-  sliderRemainder += ((float)delta * valueRange) / sliderTravel;
-  int16_t valueDelta = (int16_t)sliderRemainder;
-  if (valueDelta > 1) {
-    valueDelta = 1;
-  } else if (valueDelta < -1) {
-    valueDelta = -1;
-  }
-  if (valueDelta != 0) {
-    item.value = constrain(item.value + valueDelta, item.minimum, item.maximum);
-    sliderRemainder -= valueDelta;
-    drawCurrentPage();
-  }
+  applyRelativeDelta(settings[settingIndex], delta);
 }
 
 // swipe down = next car, swipe up = previous car, one step per CAR_SWIPE_STEP pixels
@@ -1742,48 +2675,212 @@ void updateCarsScrollAbsolute(int16_t x) {
 }
 }
 
-float readSupplyVoltage() {
+uint16_t readSupplyVoltageMilliVolts() {
   uint32_t sum = 0;
   for (uint8_t i = 0; i < 8; i++) {
     sum += analogReadMilliVolts(SUPPLY_ADC_PIN);
   }
-  return (sum / 8) * SUPPLY_DIVIDER / 1000.0f;
+  return (sum / 8) * SUPPLY_DIVIDER;
 }
 
-// periodic refresh; on the race screen only the value area is redrawn
-void updateSupplyVoltage() {
-  if (millis() - supplySampledAt < SUPPLY_SAMPLE_MS) {
+uint16_t readTrackVoltageMilliVolts() {
+  const uint32_t adcMilliVolts = analogReadMilliVolts(TRACK_VIN_ADC_PIN);
+  const uint32_t dividerUpperOhms = configItems[CONFIG_VIN_DIVIDER].value
+                                        ? 15000UL
+                                        : 10000UL;
+  int32_t trackMilliVolts = (int32_t)((adcMilliVolts *
+      (TRACK_DIVIDER_LOWER_OHMS + dividerUpperOhms)) / TRACK_DIVIDER_LOWER_OHMS) +
+      configItems[CONFIG_VOLTAGE_CORRECTION].value;
+  if (trackMilliVolts < 0) {
+    trackMilliVolts = 0;
+  }
+  if (trackMilliVolts > UINT16_MAX) {
+    trackMilliVolts = UINT16_MAX;
+  }
+  return static_cast<uint16_t>(trackMilliVolts);
+}
+
+void displaySensorUpdate() {
+  const uint32_t now = millis();
+  if (now - supplySampledAt >= SUPPLY_SAMPLE_MS) {
+    supplySampledAt = now;
+    const uint16_t measured = readSupplyVoltageMilliVolts();
+    const uint16_t previous = __atomic_load_n(&supplyVoltageMilliVolts, __ATOMIC_RELAXED);
+    if (abs((int32_t)measured - previous) >= 10) {
+      __atomic_store_n(&supplyVoltageMilliVolts, measured, __ATOMIC_RELAXED);
+    }
+  }
+
+  if (now - trackVoltageSampledAt < TRACK_VOLTAGE_SAMPLE_MS) {
     return;
   }
-  supplySampledAt = millis();
-  const float measured = readSupplyVoltage();
-  if (fabsf(measured - supplyVoltage) < 0.01f) {
+  trackVoltageSampledAt = now;
+  const uint16_t measuredTrack = readTrackVoltageMilliVolts();
+  if (measuredTrack < TRACK_SUPPLY_PRESENT_MV) {
+    __atomic_store_n(&trackSupplyAvailable, false, __ATOMIC_RELEASE);
+  } else {
+    __atomic_store_n(&trackSupplyAvailable, true, __ATOMIC_RELEASE);
+  }
+
+  if (measuredTrack >= 5500 && !trackVoltageWasValid) {
+    for (uint8_t i = 0; i < TRACK_VOLTAGE_SAMPLE_COUNT; i++) {
+      trackVoltageHistory[i] = measuredTrack;
+    }
+    trackVoltageHistorySum = (uint32_t)measuredTrack * TRACK_VOLTAGE_SAMPLE_COUNT;
+    trackVoltageHistoryCount = TRACK_VOLTAGE_SAMPLE_COUNT;
+    trackVoltageHistoryIndex = 0;
+    trackVoltageWasValid = true;
+    __atomic_store_n(&trackVoltageMilliVolts, measuredTrack, __ATOMIC_RELAXED);
     return;
   }
-  supplyVoltage = measured;
-  if (currentPage == MenuPage::Status && !welcomeVisible) {
-    screen->fillRect(300, 238, 130, 28, COLOR_PANEL_ALT);
-    printSupplyVoltage();
+
+  if (trackVoltageHistoryCount < TRACK_VOLTAGE_SAMPLE_COUNT) {
+    trackVoltageHistoryCount++;
+  } else {
+    trackVoltageHistorySum -= trackVoltageHistory[trackVoltageHistoryIndex];
+  }
+  trackVoltageHistory[trackVoltageHistoryIndex] = measuredTrack;
+  trackVoltageHistorySum += measuredTrack;
+  trackVoltageHistoryIndex = (trackVoltageHistoryIndex + 1) % TRACK_VOLTAGE_SAMPLE_COUNT;
+  const uint16_t averagedTrack = trackVoltageHistorySum / trackVoltageHistoryCount;
+  trackVoltageWasValid = averagedTrack >= 5500;
+  const uint16_t previousTrack = __atomic_load_n(&trackVoltageMilliVolts, __ATOMIC_RELAXED);
+  if (abs((int32_t)averagedTrack - previousTrack) >= 10) {
+    __atomic_store_n(&trackVoltageMilliVolts, averagedTrack, __ATOMIC_RELAXED);
+  }
+}
+
+bool displayTrackSupplyAvailable() {
+  return __atomic_load_n(&trackSupplyAvailable, __ATOMIC_ACQUIRE);
+}
+
+bool displayGetMotorControl(uint8_t *triggerPercent, uint8_t *sensiPercent,
+                            uint8_t *brakePercent) {
+  if (!triggerPercent || !sensiPercent || !brakePercent) {
+    return false;
+  }
+  *sensiPercent = constrain(__atomic_load_n(&settings[1].value, __ATOMIC_RELAXED), 0, 100);
+  *brakePercent = constrain(__atomic_load_n(&settings[0].value, __ATOMIC_RELAXED), 0, 100);
+  if (__atomic_load_n(&currentPage, __ATOMIC_ACQUIRE) != MenuPage::Status ||
+      __atomic_load_n(&welcomeVisible, __ATOMIC_ACQUIRE)) {
+    return false;
+  }
+  const int16_t angle = currentTriggerAngle();
+  const int16_t rest = __atomic_load_n(&triggerCalibrationRest, __ATOMIC_RELAXED);
+  const int16_t travel = __atomic_load_n(&triggerCalibrationTravel, __ATOMIC_RELAXED);
+  uint8_t deadband = constrain(__atomic_load_n(&configItems[CONFIG_DEADBAND].value,
+                                                __ATOMIC_RELAXED), 0, 20);
+  return mapTriggerAngleToPercent(angle, rest, travel, deadband, *triggerPercent);
+}
+
+DisplayMotorState displayGetMotorInputState() {
+  if (__atomic_load_n(&currentPage, __ATOMIC_ACQUIRE) != MenuPage::Status ||
+      __atomic_load_n(&welcomeVisible, __ATOMIC_ACQUIRE)) {
+    return DisplayMotorState::NotRaceScreen;
+  }
+  if (currentTriggerAngle() < 0) {
+    return DisplayMotorState::NoSensor;
+  }
+  if (!triggerCalibrationIsValid(triggerCalibrationRest, triggerCalibrationTravel)) {
+    return DisplayMotorState::CalibrationRequired;
+  }
+  return DisplayMotorState::Initializing;
+}
+
+void displaySetMotorState(DisplayMotorState state, uint8_t dutyPercent) {
+  __atomic_store_n(&motorState, state, __ATOMIC_RELEASE);
+  __atomic_store_n(&motorDutyPercent, dutyPercent, __ATOMIC_RELAXED);
+}
+
+void updateMotorStatusDisplay() {
+  if (currentPage == MenuPage::Status && !welcomeVisible &&
+      (__atomic_load_n(&motorState, __ATOMIC_ACQUIRE) != displayedMotorState ||
+       __atomic_load_n(&motorDutyPercent, __ATOMIC_RELAXED) != displayedMotorDutyPercent)) {
+    drawMotorStatusBadge();
     screen->flush();
+  }
+}
+
+// Render the sampled value here so LVGL stays owned by the display task.
+void updateTrackVoltageDisplay() {
+  const uint16_t measured = __atomic_load_n(&trackVoltageMilliVolts, __ATOMIC_RELAXED);
+  if (abs((int32_t)measured - displayedTrackVoltageMilliVolts) < 10) {
+    return;
+  }
+  displayedTrackVoltageMilliVolts = measured;
+  if (currentPage == MenuPage::Status && !welcomeVisible) {
+    screen->fillRect(294, 238, 112, 28, COLOR_PANEL_ALT);
+    printTrackVoltage();
+    screen->flush();
+  }
+}
+
+void updateTriggerDisplay() {
+  if ((currentPage != MenuPage::Status && currentPage != MenuPage::TriggerCalibration) || welcomeVisible) {
+    return;
+  }
+  const uint32_t now = millis();
+  if (now - triggerDisplayUpdatedAt < 200) {
+    return;
+  }
+  triggerDisplayUpdatedAt = now;
+
+  const int16_t angle = currentTriggerAngle();
+  if (angle != displayedTriggerAngle) {
+    drawCurrentPage();
+  }
+}
+
+void updateBtnTemperatureDisplay() {
+  if (currentPage != MenuPage::Status || welcomeVisible) {
+    return;
+  }
+  const uint32_t now = millis();
+  if (now - btnTemperatureDisplayUpdatedAt < 1000) {
+    return;
+  }
+  btnTemperatureDisplayUpdatedAt = now;
+
+  int16_t temperatureDeciC;
+  const int16_t current = btn9990GetTemperatureDeciC(&temperatureDeciC)
+                              ? temperatureDeciC
+                              : BTN_TEMPERATURE_INVALID;
+  if (current != displayedBtnTemperatureDeciC) {
+    drawCurrentPage();
   }
 }
 
 void displayInit() {
   Wire.begin(TOUCH_SDA, TOUCH_SCL, 300000L);
   analogReadResolution(12);
-  supplyVoltage = readSupplyVoltage();
+  analogSetAttenuation(ADC_11db);
+  pinMode(TRACK_VIN_ADC_PIN, INPUT);
+  pinMode(SUPPLY_ADC_PIN, INPUT);
+  (void)analogReadMilliVolts(TRACK_VIN_ADC_PIN);
+  (void)analogReadMilliVolts(SUPPLY_ADC_PIN);
+  supplyVoltageMilliVolts = readSupplyVoltageMilliVolts();
+  supplySampledAt = millis();
   initCars();
-  screen->begin();
+  trackVoltageMilliVolts = readTrackVoltageMilliVolts();
+  displayedTrackVoltageMilliVolts = trackVoltageMilliVolts;
+  displayReady = screen->begin();
+  if (!displayReady) {
+    return;
+  }
   configurePanel();
   drawCurrentPage();
   screen->flush();
 }
 
 void displayUpdate() {
-  updateSupplyVoltage();
-  int16_t x;
-  int16_t y;
+  if (!displayReady) {
+    return;
+  }
+  updateTrackVoltageDisplay();
+  int16_t x = touchXForLvgl;
+  int16_t y = touchYForLvgl;
   const bool touchDown = readTouch(x, y);
+  screen->setTouch(touchDown, x, y);
   if (touchDown && !touchWasDown) {
     touchStartX = x;
     touchStartY = y;
@@ -1794,7 +2891,8 @@ void displayUpdate() {
     settingsDragging = false;
     carsDragging = false;
     sliderRemainder = 0.0f;
-    sliderDirection = 0;
+    sliderLastMs = millis();
+    sliderSpeed = 0.0f;
     statusGestureAxis = 0;
     statusGestureStartX = x;
     statusGestureStartY = y;
@@ -1897,5 +2995,11 @@ void displayUpdate() {
     currentPage = carMenuReturnToSettings ? MenuPage::Settings : MenuPage::Status;
     drawCurrentPage();
   }
+  updateTriggerDisplay();
+  updateBtnTemperatureDisplay();
+  updateVinCorrectionPage();
+  updateBtnTemperatureCorrectionPage();
+  updateMotorStatusDisplay();
   touchWasDown = touchDown;
+  screen->handleTimers();
 }

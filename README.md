@@ -9,6 +9,10 @@ Touchscreen-Oberflaeche fuer das ESP32-S3 Touch AMOLED 1.64.
 - QSPI: CS 9, CLK 10, D0 11, D1 12, D2 13, D3 14
 - Display Reset: GPIO 21
 - FT3168 Touch: SDA 47, SCL 48, I2C-Adresse `0x38`
+- TLE493D Trigger-Sensor: SDA 8, SCL 15 auf einem separaten I2C-Bus; A0/P3-Autodetektion
+- BTN9990LV-Halbbruecke: IN/PWM GPIO 5, INH GPIO 7, IS GPIO 1; Startzustand ist Lowside-Bremse
+- BTN-Temperatur: Diagnosemessung ueber IS im gesperrten Zustand, Anzeige im Rennbildschirm unter `BTN`
+- Bahnspannung: `VIN` ueber GPIO 2 und den Referenzteiler 15 kOhm / 2,2 kOhm; keinen direkten Bahnspannungsanschluss an den GPIO
 - Darstellung: Landscape ueber einen software-gedrehten Arduino_Canvas
 
 Alle Board-Details (Stromversorgung, Ladeschaltung, GPIO-Belegung, Stiftleisten, TF-Karte, IMU) stehen in [docs/HARDWARE.md](docs/HARDWARE.md); der Waveshare-Schaltplan liegt als Kopie unter `docs/`.
@@ -18,13 +22,14 @@ Alle Board-Details (Stromversorgung, Ladeschaltung, GPIO-Belegung, Stiftleisten,
 - Arduino IDE/CLI
 - ESP32 Arduino Core 3.x
 - GFX Library for Arduino 1.6.8
-- Arduino_GFX SH8601 und Arduino_Canvas
+- LVGL 9.6.0
+- Arduino_GFX SH8601 und Arduino_Canvas fuer QSPI-Panelzugriff und Rotation
 
 Kompilieren und Upload:
 
 ```sh
-arduino-cli compile --fqbn esp32:esp32:esp32s3 .
-arduino-cli upload -p /dev/cu.usbmodem1101 --fqbn esp32:esp32:esp32s3 .
+arduino-cli compile --fqbn esp32:esp32:esp32s3:PSRAM=opi .
+arduino-cli upload -p /dev/cu.usbmodem1101 --fqbn esp32:esp32:esp32s3:PSRAM=opi .
 ```
 
 ## Struktur
@@ -43,7 +48,10 @@ Vier Karten (196x64 px) plus Statusleiste:
 
 - Karte 1 (oben links), Karte 2 (oben rechts), Karte 3 (unten links): frei belegbar mit einer beliebigen Einstellung (Standard: SENSI, BRAKE, EXPO). Anzeige von Name, Wert und Einheit.
 - Karte 4 (unten rechts, orange): aktives Fahrzeug (`CAR`), fest.
-- Statusleiste: `TRIGGER` (Platzhalter) und `VCC` (gemessene Betriebsspannung, siehe unten).
+- Statusleiste: `TRIGGER` (kalibrierter Wert 0 ... 100 %), `BTN`-Temperatur und `VIN` (Bahnspannung).
+- Motorstatus im Kopf: `NO VIN`, `NO SENSOR`, `CAL REQUIRED`, `RELEASE TRIGGER`, `BRAKE`, `DRIVE` oder `BTN ERROR` zeigt den aktuellen Freigabezustand.
+- Motor: Trigger 0 % bremst mit `BRAKE` nur ueber Lowside; oberhalb des Deadbands wird nur die Highside mit `SENSI` als Startwert und linear bis 100 % getaktet.
+- Freigabe: VIN muss mindestens 5,5 V betragen, Triggerkalibrierung muss gueltig sein und nach Start/VIN-Ausfall muss zuerst die Bremsposition erkannt werden. Bei VIN-Verlust fordert die Firmware Lowside-Bremse an.
 - Titelzeile: `SETTINGS` oeffnet das Settings-Menu.
 
 Gesten (die Achse wird beim ersten Bewegen festgelegt):
@@ -91,6 +99,10 @@ Zeigt den Fahrzeugnamen und vier Buttons:
 
 - Karten fuer globale Optionen, editierbar ueber den normalen Edit-Screen:
   - `DBLTAP`: Doppeltipp-Fenster in ms (200 ... 1000, Standard 400)
+  - `DEADBAND`: Endbereich je Triggerseite (0 ... 20 %, Standard 5 %); innerhalb davon werden 0 % bzw. 100 % sicher ausgegeben.
+- `VIN CORRECTION`: Dialog mit Livewert `IST`, einstellbarem Multimeterwert `SOLL` (10-mV-Schritte), `VINDIV` (15K/10K) und Speichern der Differenz als Korrektur (-500 ... +500 mV).
+- `BTN TEMP`: Kalibrierdialog mit Livewert `IST`, einstellbarem Referenzwert `SOLL` (0,1/1/10-°C-Schritte), rohem IS-Pegel in mV und gespeicherter Temperaturkorrektur (-200 ... +200 °C). Nur bei gesperrtem BTN-Ausgang.
+- `TRIGGER CALIBRATION`: Trigger loslassen und `SET 0%` waehlen, dann voll durchziehen und `SET 100%` waehlen. `SAVE` speichert den Winkelbereich; die Live-Anzeige ordnet ihn auf 0 ... 100 % ab. Gueltiger Stellweg: 15 ... 150 Grad.
 - `HELP`: zweiseitige Kurzhilfe aller Gesten mit Symbolen (Wischen horizontal/vertikal, Tap, Doppeltipp, Button)
 - `DEFAULTS`: setzt die Einstellungen aller 30 Fahrzeuge zurueck (Namen bleiben) - mit zweistufiger Sicherheitsabfrage (`WARNING` -> `NEXT`, dann `CONFIRM` -> `RESET`)
 
@@ -103,15 +115,17 @@ Zeigt den Fahrzeugnamen und vier Buttons:
 
 ## Betriebsspannung
 
-`VCC` im Rennbildschirm wird ueber BAT_ADC (GPIO 4, Teiler 200K/100K, Faktor 3) mit `analogReadMilliVolts` gemessen (8 Samples, alle 500 ms). Am USB liegen ca. 4.9 V an, am Akku 3.3 ... 4.2 V.
+`VCC` wird intern ueber BAT_ADC (GPIO 4, Teiler 200K/100K, Faktor 3) mit `analogReadMilliVolts` gemessen (8 Samples, alle 500 ms), aber nicht mehr im Rennbildschirm angezeigt. Am USB liegen ca. 4.9 V an, am Akku 3.3 ... 4.2 V.
+
+Die Bahnspannung `VIN` wird separat ueber GPIO 2 und einen 15-kOhm/2,2-kOhm-Teiler gemessen (8 Samples, alle 500 ms). Der Teiler muss vorhanden sein; niemals die Bahnspannung direkt an GPIO2 anschliessen.
 
 Hinweise zur Hardware (aus dem Waveshare-Schaltplan): Der Akku wird ueber einen P-MOSFET (AO3401) automatisch zugeschaltet, sobald kein USB anliegt; der Buck-Regler MP1605 ist immer aktiv (EN fest an VIN), der Lader ETA6098 hat keinen Steuerpin und laedt fest mit 2 A. Der `5V`-Pin der Stiftleiste liegt auf demselben Netz wie USB-VBUS, d. h. auch bei Speisung ueber den Header wird der Akku geladen (USB und externe 5 V nicht gleichzeitig anschliessen). Ein Ein-/Ausschalten des Akkus per Software ist nicht moeglich, und es gibt keinen Tiefentladeschutz auf dem Board - der Akku sollte eine eigene Schutzschaltung haben; eine Low-Battery-Abschaltung per Software (Deep Sleep) ist noch nicht implementiert. Details in [docs/HARDWARE.md](docs/HARDWARE.md).
 
 ## Darstellung
 
-Alle Farben sind als RGB565-Palette in `display_unit.cpp` gebuendelt (`COLOR_*`): schwarzer Hintergrund, deutlich abgesetzte Panels und Rahmen, gelbe Labels, weisse Werte, Cyan/Orange als Akzente, Rot fuer `CANCEL`.
+Alle Menueelemente werden als LVGL-Objekte gerendert. LVGL arbeitet mit RGB565 und einer Landscape-Aufloesung von 456 x 280; Arduino_Canvas rotiert den kompletten Frame fuer das physische 280 x 456 Panel. Die Touch-Ereignisse werden weiterhin vom FT3168 gepollt und zugleich als LVGL-Pointer bereitgestellt.
 
-Schriftgroessen (GFX `setTextSize`, nur ganzzahlig, 6x8 px pro Stufe): Ueberschriften 3, Titelzeilen-Buttons 2, Settings-Karten Label 3 / Wert 4, Fahrzeugnamen 3 (Raster) bzw. 4 (Editor), Edit-Wert 8. Nur vollstaendig sichtbare Karten werden gezeichnet, da Arduino_GFX negative X-Koordinaten nicht sauber clippt. Die C/C++-IntelliSense ist fuer diesen Workspace in `.vscode/settings.json` aktiviert, damit die Outline-Ansicht funktioniert.
+LVGL-Konfiguration und aktivierte Montserrat-Schriften liegen in `lv_conf.h`. Die C/C++-IntelliSense ist fuer diesen Workspace in `.vscode/settings.json` aktiviert, damit die Outline-Ansicht funktioniert.
 
 ## EXPO und CURVE
 
@@ -125,10 +139,11 @@ Die CURVE-Darstellung nutzt die alte zweigeteilte Kennlinie mit Vertex:
 
 ## Aktueller Entwicklungsstand
 
-Anzeige, Touch-Gesten, Menunavigation, Fahrzeugprofile (30 Stueck) und Persistenz im NVS sind funktionsfaehig. Offen:
+Anzeige, Touch-Gesten, Menunavigation, Fahrzeugprofile, VIN-Referenzmessung und grundlegende SENSI/BRAKE-Motorsteuerung sind integriert. Offen:
 
-- `TRIGGER` ist noch ein Platzhalter; die Bahnspannung (`BAHN V`) kann noch nicht gemessen werden und wurde durch `VCC` ersetzt
-- Anbindung der Einstellwerte an die ESC-/Regler-Logik
+- Triggerwinkel und Bahnspannung werden angezeigt; die VIN-Messung setzt den passenden externen Spannungsteiler voraus
+- Lowside-Bremswirkung bei VIN unterhalb der BTN-Unterspannung am Motoraufbau pruefen
+- Weitere Fahrzeugparameter (EXPO, CURVE, DRAGB, LIMIT usw.) in die Reglerlogik einbinden
 - Low-Battery-Warnung/Abschaltung (Deep Sleep) auf Basis von `VCC`
 
 Alle Konfigurationsdaten koennen ueber `Config -> DEFAULTS` (zweistufige Abfrage) zurueckgesetzt werden; alternativ `PROFILE_VERSION` in `display_unit.cpp` hochzaehlen.

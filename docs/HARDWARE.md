@@ -10,7 +10,7 @@ Zusammenfassung aller bekannten Board-Informationen. Quellen: Waveshare-Wiki, de
 | --- | --- | --- |
 | MCU | ESP32-S3 (Dual-Core LX7, 240 MHz, WiFi 2.4 GHz, BLE 5) | - |
 | Flash | W25Q128JVSI, 16 MB | SPI (VDD_SPI) |
-| PSRAM | 8 MB (ESP32-S3R8, laut Waveshare) | im Sketch deaktiviert (`PSRAM=disabled`) |
+| PSRAM | 8 MB (ESP32-S3R8, laut Waveshare) | aktiviert (`PSRAM=opi`), fuer LVGL- und Display-Framebuffer |
 | Display | 1.64" AMOLED, 280 x 456 px, 16 Bit Farbe, Controller SH8601 (Waveshare nennt CO5300, registerkompatibel) | QSPI |
 | Touch | FT3168, kapazitiv | I2C `0x38` |
 | IMU | QMI8658 (6-Achsen Accel + Gyro) | I2C |
@@ -55,6 +55,47 @@ Landscape (456 x 280) wird ueber einen software-gedrehten `Arduino_Canvas` erzeu
 I2C-Adressen: FT3168 `0x38`, QMI8658 `0x6B` (Standard, ADO an 3V3). Beide teilen sich denselben Bus
 (Pull-ups R14/R15 10 K an 3V3). Der Header-Anschluss `SDA`/`SCL` liegt auf demselben Bus.
 
+### Trigger-Sensor (TLE493D)
+
+Der Magnetsensor wird getrennt vom Touch-Bus an `Wire1` betrieben:
+
+| Signal | GPIO | Header-Pin |
+| --- | --- | --- |
+| SDA | 8 | IO8 |
+| SCL | 15 | IO15 |
+| VCC | 3V3 | 3V3 |
+| GND | GND | GND |
+
+Die Firmware erkennt die Varianten A0 (`0x35`) und P3 (`0x5D`) automatisch und liest den
+Triggerwinkel in Zehntelgrad auf jedem 1-ms-Regeltakt; die Anzeige wird separat alle 20 ms
+aktualisiert. SDA/SCL-Pull-ups muessen auf 3V3 liegen; bei einem Sensormodul mit
+integrierten Pull-ups keine zusaetzlichen Pull-ups bestuecken. GPIO8/15 sind damit fuer den
+TLE493D reserviert. Einzelne fehlgeschlagene I2C-Lesungen halten den letzten Winkel maximal 40 ms;
+bei laengerem Ausfall wird die Motorfreigabe gesperrt.
+
+### Halbbruecke (BTN9990LV)
+
+| Signal | GPIO | Header-Pin |
+| --- | --- | --- |
+| IN / PWM | 5 | IO5 |
+| INH / Enable-PWM | 7 | IO7 |
+| IS / Strommessung | 1 | IO1 |
+
+IN und INH werden beim Start mit MCPWM auf rund 30 kHz konfiguriert. Im Stillstand und bei VIN-Ausfall
+fordert die Firmware Lowside-Bremse an (IN low, INH als BRAKE-PWM); Gas taktet wie die Referenz ohne Dragbrake
+IN und INH gleichphasig mit gleichem Tastgrad (nur Highside, Freilauf ueber Diode). Der Trigger muss kalibriert sein, VIN mindestens 5,5 V betragen und die Bremsposition nach
+Start oder VIN-Ausfall erkannt werden, bevor Gas freigegeben wird. Die Temperaturmessung pulst IN
+kurz im Diagnosemodus und stellt danach den vorherigen Bremszustand wieder her. Lowside-Bremswirkung
+bei Unterspannung muss am Motoraufbau getestet werden; unterhalb der BTN-Unterspannung kann die
+Software den Leistungsausgang nicht garantieren.
+
+Bei gesperrtem Fahr-Ausgang liest die Firmware einmal pro Sekunde die BTN-Temperatur ueber IS aus.
+Unter Config -> BTN TEMP kann ein Referenzthermometer per IST/SOLL abgeglichen werden; der rohe
+IS-Pegel wird dabei zur Diagnose angezeigt.
+
+Der Statuskopf zeigt den Motor-Freigabezustand (`NO VIN`, `NO SENSOR`, `CAL REQUIRED`,
+`RELEASE TRIGGER`, `BRAKE`, `DRIVE` oder `BTN ERROR`) zur Diagnose.
+
 ### TF-Karte
 
 | Signal | GPIO | SPI-Modus | SDMMC 1-Bit |
@@ -71,9 +112,20 @@ Die Demo nutzt `SPI3_HOST`. Pull-ups 10 K (R25..R30) an 3V3.
 | Signal | GPIO | Bemerkung |
 | --- | --- | --- |
 | BAT_ADC | 4 | ADC1 Kanal 3, 12 dB Daempfung, Spannungsteiler 200 K / 100 K gegen GND -> `V = 3 * Vadc` |
+| VIN_ADC | 2 | ADC1, externer Teiler 15 K / 2,2 K gegen GND -> `V = Vadc * 17,2 / 2,2` |
 
 BAT_ADC misst das Netz `VCC` (Eingang des Buck-Reglers), nicht direkt den Akku:
 liegt 5 V an USB oder am Header, misst man ca. 4.9 V; im Akkubetrieb 3.3 ... 4.2 V.
+VIN_ADC misst die Bahnspannung mit einem kalibrierten Sample pro 1-ms-Regeltakt und einem gleitenden
+8er-Mittel. Teilerwahl (15 kOhm/2,2 kOhm oder 10 kOhm/2,2 kOhm) und mV-Korrektur werden in Config
+gespeichert. Der Waveshare-Aufbau enthaelt diesen Teiler nicht: Bahnspannung nur ueber den externen
+Teiler an GPIO2 anschliessen und niemals direkt auf einen ESP32-GPIO geben. Wenn die verwendete
+Reglerplatine den Referenzteiler bereits enthaelt, keinen zweiten Teiler ergaenzen.
+Bei VIN unter 5,5 V fordert die Firmware sofort den Low-Side-Bremszustand an (IN low, INH high).
+Ab dem ersten 1-ms-Messsample ueber 5,5 V gilt die BTN-Versorgung wieder als vorhanden; der
+Bremszustand bleibt bestehen, bis die Reglerlogik explizit einen neuen Ausgangswert setzt. Der
+ESP32 bleibt dabei aus dem Akku versorgt und startet nicht neu. Die Bremswirkung unterhalb der
+BTN-Unterspannung muss an der Hardware getestet werden.
 
 ### Sonstige
 
@@ -152,12 +204,15 @@ Details:
 
 - FQBN `esp32:esp32:esp32s3`, Optionen (aus `.vscode/arduino.json`): `USBMode=hwcdc`,
   `CDCOnBoot=default`, `FlashMode=qio`, `FlashSize=16M`, `PartitionScheme=app3M_fat9M_16MB`,
-  `PSRAM=disabled`, `CPUFreq=240`.
+  `PSRAM=opi`, `CPUFreq=240`.
 - Serieller Port am Mac: `/dev/cu.usbmodem1101` (bzw. `usbmodem101`), natives USB-CDC.
 - Download-Modus erzwingen: BOOT halten, RESET druecken und loslassen, dann BOOT loslassen.
-- Display-Treiber im Projekt: `Arduino_GFX` (`Arduino_SH8601` auf `Arduino_ESP32QSPI`), Canvas
-  mit Rotation 1, Spaltenoffset 20.
+- Display-Treiber im Projekt: LVGL 9.6.0 mit RGB565-LVGL-Objekten; `Arduino_GFX`
+  (`Arduino_SH8601` auf `Arduino_ESP32QSPI`) und Canvas mit Rotation 1 sowie
+  Spaltenoffset 20 uebernehmen Panelzugriff und Landscape-Rotation.
 - Touch: FT3168 per Polling ueber `Wire` (SDA 47, SCL 48, 300 kHz).
+- Trigger: TLE493D per `Wire1` auf GPIO8/15; Varianten A0/P3 werden ueber I2C-Adresse erkannt.
+- Halbbruecke: BTN9990LV IN GPIO5, INH GPIO7, IS GPIO1; MCPWM startet gesperrt.
 - Spannungsmessung: `analogReadMilliVolts(4) * 3.0`, 8 Samples, alle 500 ms (`SUPPLY_*` in
   `display_unit.cpp`).
 
