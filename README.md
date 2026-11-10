@@ -10,10 +10,10 @@ Touchscreen-Oberflaeche fuer das ESP32-S3 Touch AMOLED 1.64.
 - Display Reset: GPIO 21
 - FT3168 Touch: SDA 47, SCL 48, I2C-Adresse `0x38`
 - TLE493D Trigger-Sensor: SDA 8, SCL 15 auf einem separaten I2C-Bus; A0/P3-Autodetektion
-- BTN9990LV-Halbbruecke: IN/PWM GPIO 5, INH GPIO 7, IS GPIO 1; Startzustand ist Lowside-Bremse
-- BTN-Temperatur: Diagnosemessung ueber IS im gesperrten Zustand, Anzeige im Rennbildschirm unter `BTN`
+- BTN9990LV-Halbbruecke (Leistungsplatine): IN/PWM GPIO 5, INH GPIO 7; Startzustand ist Lowside-Bremse
+- Strommessung: TLE4971 ueber U8 an GPIO 1 (1,25 V + 20 mV/A), Anzeige im Rennbildschirm unter `CURRENT`
 - Bahnspannung: `VIN` ueber GPIO 2 und den Referenzteiler 15 kOhm / 2,2 kOhm; keinen direkten Bahnspannungsanschluss an den GPIO
-- Darstellung: Landscape ueber einen software-gedrehten Arduino_Canvas
+- Darstellung: Landscape, beim Flush per Software gedreht
 
 Alle Board-Details (Stromversorgung, Ladeschaltung, GPIO-Belegung, Stiftleisten, TF-Karte, IMU) stehen in [docs/HARDWARE.md](docs/HARDWARE.md); der Waveshare-Schaltplan liegt als Kopie unter `docs/`.
 
@@ -23,7 +23,7 @@ Alle Board-Details (Stromversorgung, Ladeschaltung, GPIO-Belegung, Stiftleisten,
 - ESP32 Arduino Core 3.x
 - GFX Library for Arduino 1.6.8
 - LVGL 9.6.0
-- Arduino_GFX SH8601 und Arduino_Canvas fuer QSPI-Panelzugriff und Rotation
+- Arduino_GFX SH8601 fuer QSPI-Panelzugriff (80 MHz)
 
 Kompilieren und Upload:
 
@@ -48,9 +48,11 @@ Vier Karten (196x64 px) plus Statusleiste:
 
 - Karte 1 (oben links), Karte 2 (oben rechts), Karte 3 (unten links): frei belegbar mit einer beliebigen Einstellung (Standard: SENSI, BRAKE, EXPO). Anzeige von Name, Wert und Einheit.
 - Karte 4 (unten rechts, orange): aktives Fahrzeug (`CAR`), fest.
-- Statusleiste: `TRIGGER` (kalibrierter Wert 0 ... 100 %), `BTN`-Temperatur und `VIN` (Bahnspannung).
+- Statusleiste: `TRIG` (kalibrierter Wert 0 ... 100 %), `CURR` (gemittelter Motorstrom), `BEMF` (Gegen-EMK), `PMECH` (Wellenleistung ≈ BEMF × Strom, beim Bremsen negativ), `PEL` (elektrische Motorleistung ≈ VIN × Duty × Strom beim Fahren, sonst 0) und `VIN` (Bahnspannung).
 - Motorstatus im Kopf: `NO VIN`, `NO SENSOR`, `CAL REQUIRED`, `RELEASE TRIGGER`, `BRAKE`, `DRIVE` oder `BTN ERROR` zeigt den aktuellen Freigabezustand.
 - Motor: Trigger 0 % bremst mit `BRAKE` nur ueber Lowside; oberhalb des Deadbands wird nur die Highside mit `SENSI` als Startwert und linear bis 100 % getaktet.
+- `EXPO` (-100 ... 100, 0 = linear) formt den Triggerweg vor der Abbildung auf `SENSI` ... 100 % wie die Referenz (Expo-Typ 0, exponentiell): positive Werte geben frueher mehr Gas, negative spaeter.
+- Die Motorsteuerung laeuft auf allen Seiten; geaenderte Werte wirken sofort. Nur waehrend der Triggerkalibrierung wird mit `BRAKE` gebremst (`CALIBRATING`).
 - Freigabe: VIN muss mindestens 5,5 V betragen, Triggerkalibrierung muss gueltig sein und nach Start/VIN-Ausfall muss zuerst die Bremsposition erkannt werden. Bei VIN-Verlust fordert die Firmware Lowside-Bremse an.
 - Titelzeile: `SETTINGS` oeffnet das Settings-Menu.
 
@@ -88,12 +90,14 @@ Gesten (die Achse wird beim ersten Bewegen festgelegt):
 
 ### Fahrzeug-Optionen (`CAR`)
 
-Zeigt den Fahrzeugnamen und vier Buttons:
+Zeigt den Fahrzeugnamen und sechs Buttons (`MOTOR R` und `MOTOR KV` zeigen den gespeicherten Wert):
 
 - `RENAME`: Namens-Editor. Der Name wird in 8 Zeichen-Slots mit invertiertem Cursor dargestellt; `<`/`>` bewegen den Cursor. Zwei horizontal scrollbare Zeichenreihen (Buchstaben A-Z/a-z; Ziffern, Leerzeichen, Sonderzeichen). Tap auf ein Zeichen ersetzt das Zeichen am Cursor, schneidet den Rest ab und rueckt den Cursor weiter. `SAVE` uebernimmt, `BACK` verwirft.
-- `COPY`: Ziel im Fahrzeugraster waehlen (`COPY <Name> TO`), dann Bestaetigungsseite mit `FROM`/`TO`, Checkboxen `WITH NAME` (Name mitkopieren) und `GOTO CAR` (Ziel anschliessend aktivieren). `SAVE` kopiert alle Einstellungen inkl. CURVE-X.
+- `COPY`: Ziel im Fahrzeugraster waehlen (`COPY <Name> TO`), dann Bestaetigungsseite mit `FROM`/`TO`, Checkboxen `WITH NAME` (Name mitkopieren) und `GOTO CAR` (Ziel anschliessend aktivieren). `SAVE` kopiert alle Einstellungen inkl. CURVE-X, MOTOR R und MOTOR KV.
 - `RESTORE`: wie COPY in Gegenrichtung: Quelle im Raster waehlen (`RESTORE <Name>`), Bestaetigung, `SAVE` kopiert die Quelle in das aktive Fahrzeug (optional mit Name).
-- `DEFAULTS`: Sicherheitsabfrage (`CANCEL`/`RESET`); setzt die Einstellungen des Fahrzeugs auf die Startwerte, der Name bleibt.
+- `MOTOR R`: Innenwiderstand des Motors bei festgehaltenem Anker. `MEASURE` gibt je 300 ms halben und vollen Test-Tastgrad aus (Standard 10/20 %, 10 ... 50 % in 5-%-Schritten) und rechnet R = Delta-Duty x (VIN + 0,7 V) / Delta-I; Schaltverzoegerung, Diodenspannung und Strom-Nullpunkt fallen dabei heraus. Dreht der Motor (BEMF > 0,5 V), wird abgebrochen. `SAVE` speichert den Wert fuer dieses Fahrzeug. Fahren ist auf dieser Seite gesperrt.
+- `MOTOR KV`: Motorkonstante (U/min pro Volt). Motor frei mit konstanter Drehzahl laufen lassen, extern gemessene Drehzahl als `SOLL` einstellen (50/500/5000er-Schritte), `SAVE` rechnet KV = Drehzahl / BEMF (BEMF mindestens 1 V). Live: Drehzahl, BEMF, KV und Drehmoment M = 60 / (2 pi KV) x I. Mit gespeichertem KV zeigt die Statusleiste `RPM` statt `BEMF`.
+- `DEFAULTS`: Sicherheitsabfrage (`CANCEL`/`RESET`); setzt die Einstellungen des Fahrzeugs auf die Startwerte und loescht MOTOR R und MOTOR KV, der Name bleibt.
 
 ### Config
 
@@ -101,7 +105,7 @@ Zeigt den Fahrzeugnamen und vier Buttons:
   - `DBLTAP`: Doppeltipp-Fenster in ms (200 ... 1000, Standard 400)
   - `DEADBAND`: Endbereich je Triggerseite (0 ... 20 %, Standard 5 %); innerhalb davon werden 0 % bzw. 100 % sicher ausgegeben.
 - `VIN CORRECTION`: Dialog mit Livewert `IST`, einstellbarem Multimeterwert `SOLL` (10-mV-Schritte), `VINDIV` (15K/10K) und Speichern der Differenz als Korrektur (-500 ... +500 mV).
-- `BTN TEMP`: Kalibrierdialog mit Livewert `IST`, einstellbarem Referenzwert `SOLL` (0,1/1/10-°C-Schritte), rohem IS-Pegel in mV und gespeicherter Temperaturkorrektur (-200 ... +200 °C). Nur bei gesperrtem BTN-Ausgang.
+- `CURRENT CAL`: Livewert `IST`, Referenzstrom `SOLL` (0,01/0,1/1-A-Schritte), `ZERO` misst den Nullpunkt (nur mit losgelassenem Trigger), `SAVE` skaliert und speichert die Verstaerkung (mindestens 0,5 A). Rohspannung und Gain werden zur Diagnose angezeigt.
 - `TRIGGER CALIBRATION`: Trigger loslassen und `SET 0%` waehlen, dann voll durchziehen und `SET 100%` waehlen. `SAVE` speichert den Winkelbereich; die Live-Anzeige ordnet ihn auf 0 ... 100 % ab. Gueltiger Stellweg: 15 ... 150 Grad.
 - `HELP`: zweiseitige Kurzhilfe aller Gesten mit Symbolen (Wischen horizontal/vertikal, Tap, Doppeltipp, Button)
 - `DEFAULTS`: setzt die Einstellungen aller 30 Fahrzeuge zurueck (Namen bleiben) - mit zweistufiger Sicherheitsabfrage (`WARNING` -> `NEXT`, dann `CONFIRM` -> `RESET`)
@@ -123,7 +127,7 @@ Hinweise zur Hardware (aus dem Waveshare-Schaltplan): Der Akku wird ueber einen 
 
 ## Darstellung
 
-Alle Menueelemente werden als LVGL-Objekte gerendert. LVGL arbeitet mit RGB565 und einer Landscape-Aufloesung von 456 x 280; Arduino_Canvas rotiert den kompletten Frame fuer das physische 280 x 456 Panel. Die Touch-Ereignisse werden weiterhin vom FT3168 gepollt und zugleich als LVGL-Pointer bereitgestellt.
+Alle Menueelemente werden als LVGL-Objekte gerendert. LVGL arbeitet mit RGB565 und einer Landscape-Aufloesung von 456 x 280 im Partial-Modus: Die Zeichenfunktionen verwenden vorhandene LVGL-Objekte in gleicher Reihenfolge wieder und aendern nur abweichende Eigenschaften, sodass nur geaenderte Bereiche gerendert, fuer das physische 280 x 456 Panel gedreht und uebertragen werden. Anzeige und Touch laufen alle 10 ms. Die Touch-Ereignisse werden weiterhin vom FT3168 gepollt und zugleich als LVGL-Pointer bereitgestellt.
 
 LVGL-Konfiguration und aktivierte Montserrat-Schriften liegen in `lv_conf.h`. Die C/C++-IntelliSense ist fuer diesen Workspace in `.vscode/settings.json` aktiviert, damit die Outline-Ansicht funktioniert.
 

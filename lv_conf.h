@@ -5,6 +5,7 @@
 #define LV_USE_OS LV_OS_NONE
 #define LV_USE_LOG 0
 #define LV_MEM_SIZE (96U * 1024U)
+#define LV_DEF_REFR_PERIOD 5
 #define LV_FONT_DEFAULT &lv_font_montserrat_16
 #define LV_FONT_MONTSERRAT_10 1
 #define LV_FONT_MONTSERRAT_12 1

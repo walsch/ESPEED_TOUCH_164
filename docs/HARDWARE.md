@@ -41,7 +41,7 @@ Zusammenfassung aller bekannten Board-Informationen. Quellen: Waveshare-Wiki, de
 | Backlight | keins (AMOLED, Helligkeit per Controller-Register) |
 
 Physisch 280 x 456 Pixel, Spaltenoffset 20. Der Controller kann nicht hardwareseitig drehen;
-Landscape (456 x 280) wird ueber einen software-gedrehten `Arduino_Canvas` erzeugt.
+Landscape (456 x 280) wird beim Flush per Software auf das Hochformat-Panel gedreht.
 
 ### Touch (FT3168) und IMU (QMI8658)
 
@@ -67,8 +67,7 @@ Der Magnetsensor wird getrennt vom Touch-Bus an `Wire1` betrieben:
 | GND | GND | GND |
 
 Die Firmware erkennt die Varianten A0 (`0x35`) und P3 (`0x5D`) automatisch und liest den
-Triggerwinkel in Zehntelgrad auf jedem 1-ms-Regeltakt; die Anzeige wird separat alle 20 ms
-aktualisiert. SDA/SCL-Pull-ups muessen auf 3V3 liegen; bei einem Sensormodul mit
+Triggerwinkel in Zehntelgrad auf jedem 1-ms-Regeltakt; die Anzeige und Touch-Auswertung laufen separat alle 10 ms. SDA/SCL-Pull-ups muessen auf 3V3 liegen; bei einem Sensormodul mit
 integrierten Pull-ups keine zusaetzlichen Pull-ups bestuecken. GPIO8/15 sind damit fuer den
 TLE493D reserviert. Einzelne fehlgeschlagene I2C-Lesungen halten den letzten Winkel maximal 40 ms;
 bei laengerem Ausfall wird die Motorfreigabe gesperrt.
@@ -79,22 +78,36 @@ bei laengerem Ausfall wird die Motorfreigabe gesperrt.
 | --- | --- | --- |
 | IN / PWM | 5 | IO5 |
 | INH / Enable-PWM | 7 | IO7 |
-| IS / Strommessung | 1 | IO1 |
+| Strommessung TLE4971 (ueber U8) | 1 | IO1 |
 
 IN und INH werden beim Start mit MCPWM auf rund 30 kHz konfiguriert. Im Stillstand und bei VIN-Ausfall
 fordert die Firmware Lowside-Bremse an (IN low, INH als BRAKE-PWM); Gas taktet wie die Referenz ohne Dragbrake
 IN und INH gleichphasig mit gleichem Tastgrad (nur Highside, Freilauf ueber Diode). Der Trigger muss kalibriert sein, VIN mindestens 5,5 V betragen und die Bremsposition nach
-Start oder VIN-Ausfall erkannt werden, bevor Gas freigegeben wird. Die Temperaturmessung pulst IN
-kurz im Diagnosemodus und stellt danach den vorherigen Bremszustand wieder her. Lowside-Bremswirkung
+Start oder VIN-Ausfall erkannt werden, bevor Gas freigegeben wird. Lowside-Bremswirkung
 bei Unterspannung muss am Motoraufbau getestet werden; unterhalb der BTN-Unterspannung kann die
-Software den Leistungsausgang nicht garantieren.
-
-Bei gesperrtem Fahr-Ausgang liest die Firmware einmal pro Sekunde die BTN-Temperatur ueber IS aus.
-Unter Config -> BTN TEMP kann ein Referenzthermometer per IST/SOLL abgeglichen werden; der rohe
-IS-Pegel wird dabei zur Diagnose angezeigt.
+Software den Leistungsausgang nicht garantieren. Der BTN-IS-Ausgang ist auf der Leistungsplatine
+nicht zum ESP gefuehrt; eine BTN-Temperaturmessung gibt es daher nicht.
 
 Der Statuskopf zeigt den Motor-Freigabezustand (`NO VIN`, `NO SENSOR`, `CAL REQUIRED`,
 `RELEASE TRIGGER`, `BRAKE`, `DRIVE` oder `BTN ERROR`) zur Diagnose.
+
+### Strommessung (TLE4971, Leistungsplatine)
+
+Wie im Referenzprojekt (Pro-Variante) liegt der TLE4971 ueber U8 an GPIO 1: 1,25 V bei 0 A,
+20 mV/A (Gain nominal 50000 mA/V, 40000 ... 60000). Der Strom wird jeden 1-ms-Regeltakt per ADC
+gelesen und ueber 16 Takte gemittelt; unter 30 mV gilt der Sensor als fehlend. Der Nullpunkt wird
+nach jedem Anstieg von VIN ueber 5,5 V gemessen (VIN 200 ms stabil, 1 s Stillstand, bis zu 5 Versuche
+im Abstand von 2 s): Bruecke aus, 5 ms warten, 16 Messungen, gueltig 1150 ... 1350 mV.
+Config -> CURRENT: IST/SOLL-Abgleich der Verstaerkung (mindestens 0,5 A, gespeichert als `iGain`)
+und manueller Nullpunkt (ZERO, nur mit losgelassenem Trigger).
+
+### Gegen-EMK (Motorspannung)
+
+Wie im Referenzprojekt liegt die Motorspannung ueber 15 k / 2,2 k an GPIO 3. Alle 10 ms schaltet die
+Firmware beide BTN-Eingaenge kurz ab, wartet 25 us, misst und stellt den vorherigen Zustand wieder her
+(Fahren und Bremsen). Der Nullpunkt wird einmal nach 500 ms Stillstand mit weniger als 300 mV
+Schwankung gelernt und abgezogen. Bei hohem Motorstrom kann der Strom nach 25 us noch nicht
+abgeklungen sein; der Wert ist dann zu niedrig.
 
 ### TF-Karte
 
@@ -208,8 +221,8 @@ Details:
 - Serieller Port am Mac: `/dev/cu.usbmodem1101` (bzw. `usbmodem101`), natives USB-CDC.
 - Download-Modus erzwingen: BOOT halten, RESET druecken und loslassen, dann BOOT loslassen.
 - Display-Treiber im Projekt: LVGL 9.6.0 mit RGB565-LVGL-Objekten; `Arduino_GFX`
-  (`Arduino_SH8601` auf `Arduino_ESP32QSPI`) und Canvas mit Rotation 1 sowie
-  Spaltenoffset 20 uebernehmen Panelzugriff und Landscape-Rotation.
+  (`Arduino_SH8601` auf `Arduino_ESP32QSPI`, 80 MHz) mit Spaltenoffset 20; LVGL rendert
+  partiell (nur geaenderte Bereiche, gerade ausgerichtet) und dreht die Bereiche beim Flush.
 - Touch: FT3168 per Polling ueber `Wire` (SDA 47, SCL 48, 300 kHz).
 - Trigger: TLE493D per `Wire1` auf GPIO8/15; Varianten A0/P3 werden ueber I2C-Adresse erkannt.
 - Halbbruecke: BTN9990LV IN GPIO5, INH GPIO7, IS GPIO1; MCPWM startet gesperrt.
