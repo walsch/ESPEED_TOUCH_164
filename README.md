@@ -87,7 +87,7 @@ Gesten (die Achse wird beim ersten Bewegen festgelegt):
 - Obere Haelfte: horizontales Wischen aendert den Wert relativ
 - Untere Haelfte: horizontale Position wirkt als absoluter Slider (auch per Tap); es werden keine Slider gezeichnet
 - EXPO: Graph mit Triggerposition auf X und DutyCycle auf Y
-- CURVE: gemeinsamer Graph fuer CURVX/CURVE; horizontales Wischen verschiebt X (`20 ... 80 %`), vertikales Wischen Y (`10 ... 90 %`)
+- CURVE: Diagramm mit einer Stuetzstelle (antippen/ziehen) und `LINEAR`-Button, siehe unten
 
 ### Car Menu (`SELECT CAR`)
 
@@ -143,13 +143,9 @@ LVGL-Konfiguration und aktivierte Montserrat-Schriften liegen in `lv_conf.h`. Di
 
 ## EXPO und CURVE
 
-Die EXPO-Darstellung verwendet die Berechnungsfolge aus dem alten ESPEED32-Projekt. EXPO liegt im Bereich `-100 ... 100`, wobei `0` eine gerade Kennlinie ist.
+Die EXPO-Darstellung verwendet die Berechnungsfolge aus dem alten ESPEED32-Projekt. EXPO liegt im Bereich `-100 ... 100`, wobei `0` eine gerade Kennlinie ist. Das EXPO-Diagramm zeigt CURVE und EXPO ohne SENSI (volle Hoehe).
 
-Die CURVE-Darstellung nutzt die alte zweigeteilte Kennlinie mit Vertex:
-
-- X/`CURVX`: `20 ... 80 %` Triggerposition
-- Y/`CURVE`: `10 ... 90 %` Kurvenwert
-- `SENSI` und `LIMIT` begrenzen die Kennlinie
+CURVE ist eine Beschleunigungskurve je Fahrzeug: monotoner kubischer Spline (Fritsch-Carlson, kein Ueberschwingen) durch (0,0), eine Stuetzstelle und (100,100). Im Diagramm wird die Stuetzstelle angetippt oder gezogen (X `5 ... 95 %`, Y `0 ... 100 %`); `LINEAR` setzt sie auf 50/50, `SAVE` speichert (NVS `cv<n>`), `CANCEL` verwirft. Die Karte zeigt `LIN` oder `SPL`. Reihenfolge beim Fahren: Trigger -> CURVE -> EXPO -> SENSI -> LIMIT/TORQ -> WIRE. COPY und DEFAULTS uebernehmen bzw. setzen die Kurve zurueck.
 
 ## Aktueller Entwicklungsstand
 

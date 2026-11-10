@@ -505,8 +505,6 @@ constexpr int16_t STATUS_BOTTOM_Y = 130;
 bool carMenuReturnToSettings = false;
 bool carMenuReturnToStatus = false;
 int16_t curveXValue = 50;
-int16_t curveOriginalX = 50;
-int16_t curveOriginalY = 50;
 bool touchWasDown = false;
 bool welcomeVisible = false;
 bool touchMoved = false;
@@ -717,6 +715,20 @@ struct BipolarParams {
 constexpr BipolarParams BIPOLAR_DEFAULTS = {0, 50, 0, 0, 220, 50};
 BipolarParams bipolar[CAR_COUNT];
 BipolarParams bipolarOriginal = BIPOLAR_DEFAULTS;
+constexpr CurvePoints CURVE_LINEAR = {50, 50};
+CurvePoints curvePoints[CAR_COUNT];
+CurvePoints curveOriginal = CURVE_LINEAR;
+// True while the point in the CURVE diagram is being dragged.
+bool curveDragging = false;
+constexpr int16_t CURVE_GRAPH_X = 48;
+constexpr int16_t CURVE_GRAPH_Y = 52;
+constexpr int16_t CURVE_GRAPH_WIDTH = 372;
+constexpr int16_t CURVE_GRAPH_HEIGHT = 168;
+constexpr uint8_t CURVE_MIN_X = 5;
+
+bool curveIsLinear(const CurvePoints &points) {
+  return points.x == points.y;
+}
 int32_t motorKvTargetRpm = 10000;
 int32_t displayedMotorKvBackEmf = -1;
 int32_t displayedMotorKvTargetRpm = -1;
@@ -817,6 +829,8 @@ void storeMotorData(uint8_t car) {
   prefs.putBool(key, dragContinuous[car]);
   snprintf(key, sizeof(key), "bp%u", car);
   prefs.putBytes(key, &bipolar[car], sizeof(BipolarParams));
+  snprintf(key, sizeof(key), "cv%u", car);
+  prefs.putBytes(key, &curvePoints[car], sizeof(CurvePoints));
 }
 
 void clearMotorData(uint8_t car) {
@@ -824,6 +838,7 @@ void clearMotorData(uint8_t car) {
   motorKv[car] = 0;
   dragContinuous[car] = false;
   bipolar[car] = BIPOLAR_DEFAULTS;
+  curvePoints[car] = CURVE_LINEAR;
   storeMotorData(car);
 }
 
@@ -964,6 +979,10 @@ void initCars() {
     snprintf(key, sizeof(key), "bp%u", car);
     if (prefs.getBytes(key, &bipolar[car], sizeof(BipolarParams)) != sizeof(BipolarParams)) {
       bipolar[car] = BIPOLAR_DEFAULTS;
+    }
+    snprintf(key, sizeof(key), "cv%u", car);
+    if (prefs.getBytes(key, &curvePoints[car], sizeof(CurvePoints)) != sizeof(CurvePoints)) {
+      curvePoints[car] = CURVE_LINEAR;
     }
   }
   TriggerCalibrationBlob calibration = {};
@@ -1177,7 +1196,8 @@ bool settingImplemented(uint8_t index) {
   return strcmp(name, "BRAKE") == 0 || strcmp(name, "SENSI") == 0 || strcmp(name, "EXPO") == 0 ||
          strcmp(name, "DRAGB") == 0 || strcmp(name, "PWM_F") == 0 || strcmp(name, "BRK_F") == 0 ||
          strcmp(name, "WIRE") == 0 || strcmp(name, "WLIM") == 0 || strcmp(name, "LIMIT") == 0 ||
-         strcmp(name, "BYPAS") == 0 || strcmp(name, "TORQ") == 0 || strcmp(name, "BRKRL") == 0;
+         strcmp(name, "BYPAS") == 0 || strcmp(name, "TORQ") == 0 || strcmp(name, "BRKRL") == 0 ||
+         strcmp(name, "CURVE") == 0;
 }
 
 void statusCardRect(uint8_t card, int16_t &x, int16_t &y) {
@@ -1404,6 +1424,8 @@ void printSettingValue(const SettingItem &item, int16_t x, int16_t y, uint16_t c
   screen->setCursor(x, y);
   if (item.name[0] == 'B' && item.name[1] == 'Y') {
     screen->print(bypassModeLabel(item.value));
+  } else if (strcmp(item.name, "CURVE") == 0) {
+    screen->print(curveIsLinear(curvePoints[selectedCar]) ? "LIN" : "SPL");
   } else if (strcmp(item.name, "VINDIV") == 0) {
     screen->print(item.value ? "15K" : "10K");
   } else if (item.unit == 'k') {
@@ -1439,6 +1461,47 @@ float expoCurve(float input, int16_t expo) {
   }
   const float k = -expo / 100.0f * 4.0f;
   return constrain((expf(k * input) - 1.0f) / (expf(k) - 1.0f), 0.0f, 1.0f);
+}
+
+float splineCurve(float input, const CurvePoints &points) {
+  // Read from the control task while the display may be editing: never divide by a zero-width segment.
+  if (!(0 < points.x && points.x < 100)) {
+    return constrain(input, 0.0f, 1.0f);
+  }
+  constexpr uint8_t SEGMENTS = 2;
+  const float xs[SEGMENTS + 1] = {0.0f, points.x / 100.0f, 1.0f};
+  const float ys[SEGMENTS + 1] = {0.0f, min(points.y, (uint8_t)100) / 100.0f, 1.0f};
+  float secant[SEGMENTS];
+  for (uint8_t i = 0; i < SEGMENTS; i++) {
+    secant[i] = (ys[i + 1] - ys[i]) / (xs[i + 1] - xs[i]);
+  }
+  float tangent[SEGMENTS + 1] = {secant[0], 0.0f, secant[1]};
+  tangent[1] = secant[0] * secant[1] <= 0.0f ? 0.0f : (secant[0] + secant[1]) / 2.0f;
+  // Fritsch-Carlson: limit tangents so no segment overshoots.
+  for (uint8_t i = 0; i < SEGMENTS; i++) {
+    if (secant[i] == 0.0f) {
+      tangent[i] = 0.0f;
+      tangent[i + 1] = 0.0f;
+      continue;
+    }
+    const float a = tangent[i] / secant[i];
+    const float b = tangent[i + 1] / secant[i];
+    const float s = a * a + b * b;
+    if (s > 9.0f) {
+      const float t = 3.0f / sqrtf(s);
+      tangent[i] = t * a * secant[i];
+      tangent[i + 1] = t * b * secant[i];
+    }
+  }
+  const float x = constrain(input, 0.0f, 1.0f);
+  const uint8_t segment = x < xs[1] ? 0 : 1;
+  const float h = xs[segment + 1] - xs[segment];
+  const float t = (x - xs[segment]) / h;
+  const float t2 = t * t;
+  const float t3 = t2 * t;
+  const float y = (2.0f * t3 - 3.0f * t2 + 1.0f) * ys[segment] + (t3 - 2.0f * t2 + t) * h * tangent[segment] +
+                  (-2.0f * t3 + 3.0f * t2) * ys[segment + 1] + (t3 - t2) * h * tangent[segment + 1];
+  return constrain(y, 0.0f, 1.0f);
 }
 
 namespace {
@@ -1604,7 +1667,14 @@ void drawEditPage() {
 
   const bool hasGraph = strcmp(item.name, "CURVE") == 0 || strcmp(item.name, "EXPO") == 0;
   const bool isToggle = item.name[0] == 'B' && item.name[1] == 'Y';
-  if (hasGraph) {
+  if (strcmp(item.name, "CURVE") == 0) {
+    screen->fillRoundRect(112, 6, 112, 34, 8, COLOR_PANEL);
+    screen->drawRoundRect(112, 6, 112, 34, 8, COLOR_ACCENT_WARM);
+    screen->setTextColor(COLOR_TEXT);
+    screen->setTextSize(2);
+    screen->setCursor(168 - screen->textWidth("LINEAR") / 2, 15);
+    screen->print("LINEAR");
+  } else if (hasGraph) {
     screen->setTextColor(COLOR_TEXT);
     screen->setTextSize(4);
     screen->setCursor(58, 62);
@@ -1672,31 +1742,29 @@ void drawEditPage() {
   }
 
   if (strcmp(item.name, "CURVE") == 0) {
-    const int16_t graphX = 48;
-    const int16_t graphY = 52;
-    const int16_t graphWidth = 372;
-    const int16_t graphHeight = 168;
-    const int16_t graphBottom = graphY + graphHeight;
-    const int16_t minSpeed = settings[1].value;
-    const int16_t maxSpeed = settings[9].value;
-    const int16_t vertexSpeed = minSpeed + ((maxSpeed - minSpeed) * settings[7].value) / 100;
-    const int16_t vertexX = graphX + (curveXValue * graphWidth) / 100;
-    const int16_t vertexY = graphBottom - (vertexSpeed * graphHeight) / 100;
-
-    drawGraphAxes(graphX, graphY, graphWidth, graphHeight);
-    screen->drawLine(graphX, graphBottom - (minSpeed * graphHeight) / 100, vertexX, vertexY, COLOR_ACCENT_WARM);
-    screen->drawLine(vertexX, vertexY, graphX + graphWidth, graphBottom - (maxSpeed * graphHeight) / 100, COLOR_ACCENT_WARM);
-    screen->fillCircle(vertexX, vertexY, 7, COLOR_TEXT);
+    const CurvePoints &points = curvePoints[selectedCar];
+    const int16_t graphBottom = CURVE_GRAPH_Y + CURVE_GRAPH_HEIGHT;
+    drawGraphAxes(CURVE_GRAPH_X, CURVE_GRAPH_Y, CURVE_GRAPH_WIDTH, CURVE_GRAPH_HEIGHT);
+    screen->drawLine(CURVE_GRAPH_X, graphBottom, CURVE_GRAPH_X + CURVE_GRAPH_WIDTH, CURVE_GRAPH_Y, COLOR_TRACK);
+    int16_t previousX = CURVE_GRAPH_X;
+    int16_t previousY = graphBottom;
+    for (int16_t step = 1; step <= 93; step++) {
+      const float input = step / 93.0f;
+      const int16_t currentX = CURVE_GRAPH_X + (int16_t)(input * CURVE_GRAPH_WIDTH);
+      const int16_t currentY = graphBottom - (int16_t)(splineCurve(input, points) * CURVE_GRAPH_HEIGHT);
+      screen->drawLine(previousX, previousY, currentX, currentY, COLOR_ACCENT_WARM);
+      previousX = currentX;
+      previousY = currentY;
+    }
+    screen->fillCircle(CURVE_GRAPH_X + points.x * CURVE_GRAPH_WIDTH / 100,
+                       graphBottom - points.y * CURVE_GRAPH_HEIGHT / 100, 9,
+                       curveDragging ? COLOR_ACCENT : COLOR_TEXT);
+    char text[24];
+    snprintf(text, sizeof(text), "X %u%%  Y %u%%", points.x, points.y);
     screen->setTextColor(COLOR_LABEL);
-    screen->setTextSize(1);
-    screen->setCursor(56, 58);
-    screen->print("CURVE X/Y");
-    screen->setCursor(56, 204);
-    screen->print("X: ");
-    screen->print(curveXValue);
-    screen->print("%   Y: ");
-    screen->print(settings[7].value);
-    screen->print("%");
+    screen->setTextSize(2);
+    screen->setCursor(CURVE_GRAPH_X + 12, CURVE_GRAPH_Y + 4);
+    screen->print(text);
   } else if (strcmp(item.name, "EXPO") == 0) {
     const int16_t graphX = 48;
     const int16_t graphY = 52;
@@ -1709,13 +1777,11 @@ void drawEditPage() {
     screen->setTextSize(1);
     screen->setCursor(310, 58);
     screen->print("EXPO CURVE");
-    // Duty over trigger as driven: SENSI at first movement, EXPO-shaped up to 100%.
-    const float sensi = settings[1].value / 100.0f;
-    const float limit = 1.0f;
+    // CURVE and EXPO only; SENSI is left out so the shape uses the full height.
     int16_t previousX = graphX;
-    int16_t previousY = graphBottom - (int16_t)(sensi * graphHeight);
+    int16_t previousY = graphBottom;
     for (int16_t point = 2; point <= 100; point += 2) {
-      const float output = sensi + (limit - sensi) * expoCurve(point / 100.0f, item.value);
+      const float output = expoCurve(splineCurve(point / 100.0f, curvePoints[selectedCar]), item.value);
       const int16_t currentX = graphX + (point * (graphWidth - 1)) / 100;
       const int16_t currentY = graphBottom - (int16_t)(output * graphHeight);
       screen->drawLine(previousX, previousY, currentX, currentY, COLOR_ACCENT_WARM);
@@ -2884,6 +2950,7 @@ bool readTouch(int16_t &x, int16_t &y) {
 }
 
 void updateValueFromAbsoluteSlider(int16_t x);
+void moveCurvePoint(int16_t touchX, int16_t touchY, bool dragging);
 
 void setCarNameChar(uint8_t position, char c) {
   char *name = carNames[selectedCar];
@@ -3026,8 +3093,8 @@ void handleTouch(int16_t x, int16_t y) {
           editOriginalValue = settings[index].value;
           editOriginalDragContinuous = dragContinuous[selectedCar];
           if (strcmp(settings[index].name, "CURVE") == 0) {
-            curveOriginalX = curveXValue;
-            curveOriginalY = settings[index].value;
+            curveOriginal = curvePoints[selectedCar];
+            curveDragging = false;
           }
           currentPage = MenuPage::Edit;
           break;
@@ -3052,6 +3119,12 @@ void handleTouch(int16_t x, int16_t y) {
       drawCurrentPage();
       return;
     }
+    const bool curveDialog = !editingConfig && strcmp(editItem().name, "CURVE") == 0;
+    if (curveDialog && y < 50 && x >= 112 && x < 224) {
+      curvePoints[selectedCar] = CURVE_LINEAR;
+      drawCurrentPage();
+      return;
+    }
     const bool cancelTap = x >= 232 && x < 332 && y < 50;
     const bool saveTap = x >= 342 && x < 442 && y < 50;
     if (cancelTap || saveTap) {
@@ -3065,20 +3138,26 @@ void handleTouch(int16_t x, int16_t y) {
           prefs.putBool(key, dragContinuous[selectedCar]);
         }
       }
+      if (curveDialog) {
+        if (cancelTap) {
+          curvePoints[selectedCar] = curveOriginal;
+        } else if (memcmp(&curvePoints[selectedCar], &curveOriginal, sizeof(CurvePoints)) != 0) {
+          FullContactWriteGuard guard;
+          storeMotorData(selectedCar);
+        }
+      }
       if (cancelTap) {
         if (!editingConfig && selectedSetting == SETTING_WIRE) {
           editWireLimit = false;
           settings[SETTING_WIRE_LIMIT].value = editOriginalWireLimit;
         }
         editItem().value = editOriginalValue;
-        if (strcmp(editItem().name, "CURVE") == 0) {
-          curveXValue = curveOriginalX;
-          editItem().value = curveOriginalY;
-        }
       }
       editWireLimit = false;
       currentPage = editingConfig ? MenuPage::Config : MenuPage::Settings;
       drawCurrentPage();
+    } else if (curveDialog) {
+      moveCurvePoint(x, y, false);
     } else if (y >= EDIT_SPLIT_Y) {
       updateValueFromAbsoluteSlider(x);
     }
@@ -3502,6 +3581,7 @@ void handleTouch(int16_t x, int16_t y) {
       motorKv[destCar] = motorKv[sourceCar];
       dragContinuous[destCar] = dragContinuous[sourceCar];
       bipolar[destCar] = bipolar[sourceCar];
+      curvePoints[destCar] = curvePoints[sourceCar];
       storeMotorData(destCar);
       if (copyWithName) {
         strcpy(carNames[destCar], carNames[sourceCar]);
@@ -3650,18 +3730,14 @@ void updateCarFromSwipe(int16_t deltaY) {
   }
 }
 
-void updateCurveFromGesture(int16_t deltaX, int16_t deltaY) {
-  const int16_t xStep = deltaX / 8;
-  const int16_t yStep = -deltaY / 8;
-  if (xStep != 0) {
-    curveXValue = constrain(curveXValue + xStep, (int16_t)20, (int16_t)80);
-  }
-  if (yStep != 0) {
-    settings[7].value = constrain(settings[7].value + yStep, (int16_t)10, (int16_t)90);
-  }
-  if (xStep != 0 || yStep != 0) {
-    drawCurrentPage();
-  }
+// Moves the point to the touch position.
+void moveCurvePoint(int16_t touchX, int16_t touchY, bool dragging) {
+  CurvePoints &points = curvePoints[selectedCar];
+  const int16_t graphBottom = CURVE_GRAPH_Y + CURVE_GRAPH_HEIGHT;
+  points.x = constrain((touchX - CURVE_GRAPH_X) * 100 / CURVE_GRAPH_WIDTH, CURVE_MIN_X, 100 - CURVE_MIN_X);
+  points.y = constrain((graphBottom - touchY) * 100 / CURVE_GRAPH_HEIGHT, 0, 100);
+  curveDragging = dragging;
+  drawCurrentPage();
 }
 
 void updateValueFromAbsoluteSlider(int16_t x) {
@@ -3820,6 +3896,10 @@ uint16_t displayGetVoltageLimitMilliVolts() {
 
 uint8_t displayGetBypassMode() {
   return constrain(__atomic_load_n(&settings[SETTING_BYPASS].value, __ATOMIC_RELAXED), 0, 2);
+}
+
+CurvePoints displayGetCurve() {
+  return curvePoints[selectedCar];
 }
 
 uint16_t displayGetBrakeReleaseMilliVolts() {
@@ -4041,10 +4121,8 @@ void displayUpdate() {
       carsDragging = true;
       touchSliderActive = true;
     } else if (!welcomeVisible && currentPage == MenuPage::Edit &&
-        strcmp(editItem().name, "CURVE") == 0 && touchMoved) {
-      updateCurveFromGesture(touchLastX - touchStartX, touchLastY - touchStartY);
-      touchStartX = touchLastX;
-      touchStartY = touchLastY;
+        strcmp(editItem().name, "CURVE") == 0 && touchMoved && touchStartY >= 50) {
+      moveCurvePoint(touchLastX, touchLastY, true);
       touchSliderActive = true;
     } else if (!welcomeVisible && currentPage == MenuPage::Edit &&
         abs(touchLastX - touchStartX) >= abs(touchLastY - touchStartY) &&
@@ -4059,6 +4137,10 @@ void displayUpdate() {
       touchSliderActive = true;
     }
   } else if (!touchDown && touchWasDown) {
+    if (curveDragging && touchSliderActive) {
+      curveDragging = false;
+      drawCurrentPage();
+    }
     if (settingsDragging) {
       settingsScroll = constrain((int16_t)((settingsScroll + SETTINGS_COLUMN_STEP / 2) / SETTINGS_COLUMN_STEP) * SETTINGS_COLUMN_STEP,
                                  (int16_t)0, SETTINGS_MAX_SCROLL);

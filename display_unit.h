@@ -49,6 +49,13 @@ struct BipolarSettings {
 bool displayGetBipolar(BipolarSettings *settings);
 void displayGetPwmFrequencies(uint32_t *driveHz, uint32_t *brakeHz);
 float expoCurve(float input, int16_t expo);
+// CURVE: monotone cubic spline (Fritsch-Carlson) through (0,0), the point in % and (100,100).
+struct CurvePoints {
+	uint8_t x;
+	uint8_t y;
+};
+float splineCurve(float input, const CurvePoints &points);
+CurvePoints displayGetCurve();
 DisplayMotorState displayGetMotorInputState();
 void displaySetMotorState(DisplayMotorState state, uint16_t dutyPermille);
 

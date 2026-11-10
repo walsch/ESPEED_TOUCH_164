@@ -285,7 +285,9 @@ void vehicleControlTask(void *parameter) {
 			outputAccepted = applyBrake();
 			commandedDutyPermille = brakePercent * 10U;
 		} else {
-			const uint16_t curvedPermille = applyExpo(triggerPermille, displayGetExpo());
+			const uint16_t shapedTriggerPermille = static_cast<uint16_t>(
+				splineCurve(triggerPermille / 1000.0f, displayGetCurve()) * 1000.0f + 0.5f);
+			const uint16_t curvedPermille = applyExpo(shapedTriggerPermille, displayGetExpo());
 			const uint16_t sensiPermille = sensiPercent * 10U;
 			uint16_t curvedThrottlePermille = sensiPermille +
 				((1000U - sensiPermille) * curvedPermille + 500U) / 1000U;
