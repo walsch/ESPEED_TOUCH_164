@@ -1,15 +1,40 @@
 #include "back_emf.h"
 
 #include <Arduino.h>
+#include "adc_sampler.h"
 
 namespace {
-constexpr uint8_t MOTOR_VOLTAGE_PIN = 3;
 constexpr uint32_t DIVIDER_LOWER_OHMS = 2200;
 constexpr uint32_t DIVIDER_UPPER_OHMS = 15000;
 // Reference BemfZeroLearn: 500 ms uninterrupted standstill with < 300 mV spread.
 constexpr uint32_t ZERO_LEARN_MS = 500;
 constexpr uint32_t ZERO_GAP_MS = 20;
 constexpr uint16_t ZERO_STABLE_MV = 300;
+constexpr uint32_t MAX_SETTLE_US = 400;
+// The sampler delivers 4 motor samples per 100 us frame; 8 guarantees a frame taken after the pause.
+constexpr uint32_t SAMPLES_PER_FRAME = 4;
+constexpr uint16_t STABLE_MV = 150;
+constexpr uint16_t CLAMP_MARGIN_MV = 300;
+constexpr int32_t CURRENT_FLOWING_MA = 300;
+
+uint32_t lastSettleUs = 0;
+
+uint16_t readMotorMilliVolts() {
+  uint16_t pinMilliVolts = 0;
+  adcSamplerRead(AdcInput::MotorVoltage, &pinMilliVolts);
+  return min<uint32_t>((uint32_t)pinMilliVolts * (DIVIDER_LOWER_OHMS + DIVIDER_UPPER_OHMS) / DIVIDER_LOWER_OHMS,
+                       UINT16_MAX);
+}
+
+// Busy-waits until the sampler has delivered `count` more motor samples; false on timeout.
+bool waitMotorSamples(uint32_t fromSequence, uint32_t count, uint32_t startUs) {
+  while (adcSamplerMotorSequence() - fromSequence < count) {
+    if (micros() - startUs >= MAX_SETTLE_US) {
+      return false;
+    }
+  }
+  return true;
+}
 
 uint16_t backEmfMilliVolts = 0;
 bool backEmfValid = false;
@@ -47,14 +72,28 @@ void learnOffset(uint16_t milliVolts, uint32_t now) {
 }
 
 void backEmfBegin() {
-  pinMode(MOTOR_VOLTAGE_PIN, INPUT);
-  analogSetPinAttenuation(MOTOR_VOLTAGE_PIN, ADC_11db);
 }
 
-void backEmfSample(bool standing) {
-  const uint32_t pinMilliVolts = analogReadMilliVolts(MOTOR_VOLTAGE_PIN);
-  const uint16_t raw = min<uint32_t>(pinMilliVolts * (DIVIDER_LOWER_OHMS + DIVIDER_UPPER_OHMS) /
-                                         DIVIDER_LOWER_OHMS, UINT16_MAX);
+void backEmfSample(bool standing, int32_t motorMilliAmps, uint32_t vinMilliVolts) {
+  // While the winding current decays the output is clamped by a body diode (about 0 V when
+  // driving, about VIN when braking); wait until it leaves the clamp and two frames agree.
+  const uint32_t startUs = micros();
+  uint32_t sequence = adcSamplerMotorSequence();
+  waitMotorSamples(sequence, 2 * SAMPLES_PER_FRAME, startUs);
+  uint16_t previous = readMotorMilliVolts();
+  uint16_t raw = previous;
+  sequence = adcSamplerMotorSequence();
+  while (waitMotorSamples(sequence, SAMPLES_PER_FRAME, startUs)) {
+    sequence = adcSamplerMotorSequence();
+    raw = readMotorMilliVolts();
+    const bool clampedLow = motorMilliAmps > CURRENT_FLOWING_MA && raw < CLAMP_MARGIN_MV;
+    const bool clampedHigh = motorMilliAmps < -CURRENT_FLOWING_MA && raw + CLAMP_MARGIN_MV > vinMilliVolts;
+    if (!clampedLow && !clampedHigh && abs((int32_t)raw - previous) <= STABLE_MV) {
+      break;
+    }
+    previous = raw;
+  }
+  __atomic_store_n(&lastSettleUs, micros() - startUs, __ATOMIC_RELAXED);
   if (standing && !offsetLearned) {
     learnOffset(raw, millis());
   }
@@ -75,8 +114,15 @@ bool backEmfOffsetLearned() {
   return __atomic_load_n(&offsetLearned, __ATOMIC_ACQUIRE);
 }
 
+uint32_t backEmfLastSettleMicros() {
+  return __atomic_load_n(&lastSettleUs, __ATOMIC_RELAXED);
+}
+
 bool backEmfReadMotorMilliVolts(uint32_t *milliVolts) {
-  const uint32_t pinMilliVolts = analogReadMilliVolts(MOTOR_VOLTAGE_PIN);
-  *milliVolts = pinMilliVolts * (DIVIDER_LOWER_OHMS + DIVIDER_UPPER_OHMS) / DIVIDER_LOWER_OHMS;
+  uint16_t pinMilliVolts = 0;
+  if (!adcSamplerRead(AdcInput::MotorVoltage, &pinMilliVolts)) {
+    return false;
+  }
+  *milliVolts = (uint32_t)pinMilliVolts * (DIVIDER_LOWER_OHMS + DIVIDER_UPPER_OHMS) / DIVIDER_LOWER_OHMS;
   return pinMilliVolts > 0;
 }

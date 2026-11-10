@@ -2,10 +2,10 @@
 
 #include <Arduino.h>
 #include <Preferences.h>
+#include "adc_sampler.h"
 #include "full_contact.h"
 
 namespace {
-constexpr uint8_t CURRENT_SENSE_PIN = 1;
 constexpr uint16_t OFFSET_NOMINAL_MV = 1250;
 constexpr uint16_t OFFSET_MIN_MV = 1150;
 constexpr uint16_t OFFSET_MAX_MV = 1350;
@@ -28,9 +28,6 @@ uint8_t zeroResult = 0;
 }
 
 void currentSensorBegin() {
-  analogReadResolution(12);
-  pinMode(CURRENT_SENSE_PIN, INPUT);
-  analogSetPinAttenuation(CURRENT_SENSE_PIN, ADC_11db);
   Preferences prefs;
   if (prefs.begin(PREFS_NAMESPACE, true)) {
     gain = constrain(prefs.getInt(PREFS_GAIN_KEY, GAIN_NOMINAL), CURRENT_GAIN_MIN, CURRENT_GAIN_MAX);
@@ -39,7 +36,8 @@ void currentSensorBegin() {
 }
 
 void currentSensorUpdate() {
-  const uint16_t milliVolts = analogReadMilliVolts(CURRENT_SENSE_PIN);
+  uint16_t milliVolts = 0;
+  adcSamplerRead(AdcInput::Current, &milliVolts);
   __atomic_store_n(&rawMilliVolts, milliVolts, __ATOMIC_RELAXED);
   if (milliVolts < INVALID_BELOW_MV) {
     __atomic_store_n(&sampleValid, false, __ATOMIC_RELEASE);
@@ -48,9 +46,9 @@ void currentSensorUpdate() {
   const int32_t deltaMilliVolts = (int32_t)milliVolts - __atomic_load_n(&offsetMilliVolts, __ATOMIC_RELAXED);
   const int32_t milliAmps = (int32_t)(((int64_t)deltaMilliVolts * __atomic_load_n(&gain, __ATOMIC_RELAXED)) / 1000);
   __atomic_store_n(&latestMilliAmps, milliAmps, __ATOMIC_RELAXED);
-  // ~16 ms time constant at 1 ms cycle, as in the reference.
+  // ~16 ms time constant at 0.5 ms cycle, as in the reference.
   int32_t average = __atomic_load_n(&averageMilliAmps, __ATOMIC_RELAXED);
-  average += (milliAmps - average) / 16;
+  average += (milliAmps - average) / 32;
   __atomic_store_n(&averageMilliAmps, average, __ATOMIC_RELAXED);
   __atomic_store_n(&sampleValid, true, __ATOMIC_RELEASE);
 }
@@ -59,12 +57,14 @@ bool currentSensorMeasureOffset() {
   uint32_t sum = 0;
   uint8_t count = 0;
   for (uint8_t i = 0; i < 24 && count < 16; i++) {
-    const uint16_t milliVolts = analogReadMilliVolts(CURRENT_SENSE_PIN);
+    // One new current sample every 50 us from the sampler.
+    delayMicroseconds(100);
+    uint16_t milliVolts = 0;
+    adcSamplerRead(AdcInput::Current, &milliVolts);
     if (milliVolts >= INVALID_BELOW_MV) {
       sum += milliVolts;
       count++;
     }
-    delayMicroseconds(100);
   }
   const uint16_t value = count > 0 ? (sum + count / 2U) / count : 0;
   const bool ok = count >= 16 && value >= OFFSET_MIN_MV && value <= OFFSET_MAX_MV;

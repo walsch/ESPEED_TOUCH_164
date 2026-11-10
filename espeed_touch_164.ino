@@ -6,25 +6,47 @@
 #include "back_emf.h"
 #include "motor_resistance.h"
 #include "full_contact.h"
+#include "adc_sampler.h"
 #include <Arduino.h>
+#include <driver/gptimer.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
 namespace {
-constexpr uint32_t CONTROL_PERIOD_MS = 1;
+constexpr uint32_t CONTROL_PERIOD_US = 500;
 constexpr uint32_t DISPLAY_PERIOD_MS = 10;
-constexpr uint32_t TRIGGER_SAMPLE_MS = CONTROL_PERIOD_MS;
 // Reference: zero after VIN stable 200 ms and 1 s standstill, up to 5 tries 2 s apart.
 constexpr uint32_t CURRENT_ZERO_VIN_STABLE_MS = 200;
 constexpr uint32_t CURRENT_ZERO_STANDING_MS = 1000;
 constexpr uint32_t CURRENT_ZERO_RETRY_MS = 2000;
 constexpr uint8_t CURRENT_ZERO_TRIES = 5;
 constexpr uint32_t BACK_EMF_SAMPLE_MS = 10;
-// Reference BEMF_SETTLE_US: wait after switching off before reading.
-constexpr uint32_t BACK_EMF_SETTLE_US = 25;
+// EMF observer for BIPOL: U = D * VIN - I * R_A every cycle, offset corrected by each BEMF sample.
+constexpr float EMF_CORRECTION_GAIN = 0.3f;
 
 uint16_t applyExpo(uint16_t permille, int16_t expo) {
 	return static_cast<uint16_t>(expoCurve(permille / 1000.0f, expo) * 1000.0f + 0.5f);
+}
+
+// Ideal NPN emitter follower (constant hFE, no saturation) with motor feedback via SENSI:
+// V_LIM - band(1-x) - R_B - node; node - CHOKE - base; node - SENSI - emitter = motor.
+constexpr float BIPOLAR_VBE = 0.7f;
+
+uint16_t bipolarDutyPermille(const BipolarSettings &b, uint16_t triggerPermille,
+		float limitVolts, float vinVolts, float emfVolts) {
+	const float x = triggerPermille / 1000.0f;
+	const float rUp = b.bandOhms * (1.0f - x) + b.rbOhms;
+	const float k = b.chokeOhms / b.sensiOhms;
+	// Thevenin equivalent seen by the motor: U = U0 - R_out * I.
+	const float rOut = (rUp * (1.0f + k) + b.chokeOhms) / (b.hfe + 1.0f + k);
+	const float u0 = limitVolts - BIPOLAR_VBE * (1.0f + (rUp - rOut) / b.sensiOhms);
+	if (vinVolts <= 0.0f || u0 <= emfVolts) {
+		// An emitter follower cannot sink current: the motor coasts.
+		return 0;
+	}
+	// Solved with the motor model I = (U - EMF) / R_A instead of a current loop.
+	const float u = min((u0 * b.motorOhms + rOut * emfVolts) / (b.motorOhms + rOut), vinVolts);
+	return static_cast<uint16_t>(u / vinVolts * 1000.0f + 0.5f);
 }
 
 // Reference wire_choke: AWG18 stranded copper, 7 mOhm per ft; current filter 10 ms.
@@ -82,15 +104,37 @@ void displayTask(void *parameter) {
 	}
 }
 
+bool IRAM_ATTR onControlTick(gptimer_handle_t, const gptimer_alarm_event_data_t *, void *task) {
+	BaseType_t woken = pdFALSE;
+	vTaskNotifyGiveFromISR(static_cast<TaskHandle_t>(task), &woken);
+	return woken == pdTRUE;
+}
+
+// The FreeRTOS tick (1 ms) is too coarse for the control period.
+bool startControlTimer(TaskHandle_t task) {
+	gptimer_handle_t timer = nullptr;
+	const gptimer_config_t config = {
+		.clk_src = GPTIMER_CLK_SRC_DEFAULT,
+		.direction = GPTIMER_COUNT_UP,
+		.resolution_hz = 1000000,
+	};
+	gptimer_alarm_config_t alarm = {};
+	alarm.alarm_count = CONTROL_PERIOD_US;
+	alarm.flags.auto_reload_on_alarm = true;
+	const gptimer_event_callbacks_t callbacks = {.on_alarm = onControlTick};
+	return gptimer_new_timer(&config, &timer) == ESP_OK &&
+		gptimer_set_alarm_action(timer, &alarm) == ESP_OK &&
+		gptimer_register_event_callbacks(timer, &callbacks, task) == ESP_OK &&
+		gptimer_enable(timer) == ESP_OK &&
+		gptimer_start(timer) == ESP_OK;
+}
+
 void vehicleControlTask(void *parameter) {
 	(void)parameter;
-	bool sensorInitialized = false;
-	bool sensorInitAttempted = false;
-	uint32_t sensorInitAt = 0;
-	uint32_t triggerSampleAt = 0;
 	bool previousTrackSupplyAvailable = false;
 	bool motorArmed = false;
 	uint16_t previousTriggerPermille = 0;
+	uint32_t previousTriggerSample = 0;
 	bool decelerating = false;
 	WireChoke wireChoke;
 	bool driving = false;
@@ -100,27 +144,24 @@ void vehicleControlTask(void *parameter) {
 	uint8_t currentZeroTries = 0;
 	uint32_t currentZeroTriedAt = 0;
 	uint32_t backEmfSampleAt = 0;
-	TickType_t lastWakeTime = xTaskGetTickCount();
+	uint16_t lastDrivePermille = 0;
+	float bipolarMotorOhms = 0.0f;
+	float emfCorrectionVolts = 0.0f;
+	const bool controlTimerRunning = startControlTimer(xTaskGetCurrentTaskHandle());
 	for (;;) {
 		displaySensorUpdate();
 		currentSensorUpdate();
 		const uint32_t now = millis();
 		const bool trackSupplyAvailable = displayTrackSupplyAvailable();
-		if (!sensorInitialized && (!sensorInitAttempted || now - sensorInitAt >= 1000)) {
-			sensorInitAttempted = true;
-			sensorInitAt = now;
-			sensorInitialized = triggerSensorBegin();
-		}
-		if (sensorInitialized && now - triggerSampleAt >= TRIGGER_SAMPLE_MS) {
-			triggerSampleAt = now;
-			triggerSensorUpdate();
-		}
+		const bool sensorInitialized = triggerSensorReady();
 
 		uint16_t triggerPermille = 0;
 		uint8_t sensiPercent = 0;
 		uint8_t brakePercent = 100;
 		const bool controlInputValid = sensorInitialized &&
 			displayGetMotorControl(&triggerPermille, &sensiPercent, &brakePercent);
+		const uint32_t triggerSample = triggerSensorSampleCount();
+		const bool newTriggerSample = triggerSample != previousTriggerSample;
 		DisplayMotorState motorState = DisplayMotorState::Initializing;
 		if (!btn9990IsReady()) {
 			motorState = DisplayMotorState::DriverError;
@@ -194,12 +235,34 @@ void vehicleControlTask(void *parameter) {
 			uint16_t curvedThrottlePermille = sensiPermille +
 				((1000U - sensiPermille) * curvedPermille + 500U) / 1000U;
 			const bool triggerFull = triggerPermille >= 1000;
+			const uint32_t limitMilliVolts = displayGetVoltageLimitMilliVolts();
+			BipolarSettings bipolar;
+			const bool bipolarActive = displayGetBipolar(&bipolar);
+			if (bipolarActive) {
+				bipolarMotorOhms = bipolar.motorOhms;
+				float emfVolts = 0.0f;
+				int32_t averageMilliAmps = 0;
+				uint16_t emfMilliVolts = 0;
+				if (lastDrivePermille > 0 && currentSensorGetMilliAmps(&averageMilliAmps)) {
+					emfVolts = max(0.0f, lastDrivePermille / 1000.0f * vinMilliVolts / 1000.0f -
+						averageMilliAmps / 1000.0f * bipolar.motorOhms + emfCorrectionVolts);
+				} else if (backEmfGetMilliVolts(&emfMilliVolts)) {
+					emfVolts = emfMilliVolts / 1000.0f;
+				}
+				const uint32_t vLimit = limitMilliVolts > 0 && limitMilliVolts < vinMilliVolts
+					? limitMilliVolts : vinMilliVolts;
+				curvedThrottlePermille = trackSupplyAvailable
+					? bipolarDutyPermille(bipolar, triggerPermille, vLimit / 1000.0f,
+						vinMilliVolts / 1000.0f, emfVolts)
+					: 0;
+			} else {
+				bipolarMotorOhms = 0.0f;
+			}
 			if (bypassMode > 0 && triggerFull) {
 				// BYPAS: everything available at full trigger (no curve, no LIMIT; FULL mode adds the contact).
 				curvedThrottlePermille = 1000;
-			} else {
+			} else if (!bipolarActive) {
 				// LIMIT (reference target voltage): mean drive voltage at most LIMIT.
-				const uint32_t limitMilliVolts = displayGetVoltageLimitMilliVolts();
 				if (limitMilliVolts > 0) {
 					if (!trackSupplyAvailable) {
 						curvedThrottlePermille = 0;
@@ -216,12 +279,11 @@ void vehicleControlTask(void *parameter) {
 			const uint16_t throttlePermille = applyWireChoke(wireChoke, curvedThrottlePermille, triggerPermille,
 				motorMilliAmps, vinMilliVolts, wireTenthFeet, wireLimitPercent);
 			// Reference DRAGM DECL: drag only while the trigger is being released.
+			// Judged per trigger sample, the loop runs faster than the sensor.
 			if (triggerPermille >= 1000) {
 				decelerating = false;
-			} else if (!decelerating && triggerPermille < previousTriggerPermille) {
-				decelerating = true;
-			} else if (decelerating && triggerPermille >= previousTriggerPermille) {
-				decelerating = false;
+			} else if (newTriggerSample) {
+				decelerating = triggerPermille < previousTriggerPermille;
 			}
 			fullContactUpdate(fullContactEnabled, triggerFull, throttlePermille >= 1000, vinMilliVolts);
 			const uint16_t dragPermille = (decelerating || displayGetDragContinuous()) && fullContactLowSideAllowed()
@@ -235,7 +297,11 @@ void vehicleControlTask(void *parameter) {
 				motorState = DisplayMotorState::DrivingFull;
 			}
 		}
-		previousTriggerPermille = controlInputValid ? triggerPermille : 0;
+		if (!controlInputValid || newTriggerSample) {
+			previousTriggerPermille = controlInputValid ? triggerPermille : 0;
+			previousTriggerSample = triggerSample;
+		}
+		lastDrivePermille = btn9990IsOutputEnabled() ? commandedDutyPermille : 0;
 		if (!btn9990IsOutputEnabled()) {
 			decelerating = false;
 		}
@@ -251,10 +317,20 @@ void vehicleControlTask(void *parameter) {
 		}
 		if (now - backEmfSampleAt >= BACK_EMF_SAMPLE_MS && !fullContactRequested()) {
 			backEmfSampleAt = now;
+			int32_t milliAmpsBefore = 0;
+			currentSensorGetLatestMilliAmps(&milliAmpsBefore);
 			btn9990PauseOutput();
-			delayMicroseconds(BACK_EMF_SETTLE_US);
-			backEmfSample(!driving);
+			backEmfSample(!driving, milliAmpsBefore, vinMilliVolts);
 			btn9990ResumeOutput();
+			uint16_t measuredMilliVolts;
+			int32_t averageMilliAmps;
+			if (bipolarMotorOhms > 0.0f && lastDrivePermille > 0 &&
+				backEmfGetMilliVolts(&measuredMilliVolts) && currentSensorGetMilliAmps(&averageMilliAmps)) {
+				const float modelVolts = lastDrivePermille / 1000.0f * vinMilliVolts / 1000.0f -
+					averageMilliAmps / 1000.0f * bipolarMotorOhms;
+				emfCorrectionVolts += EMF_CORRECTION_GAIN *
+					(measuredMilliVolts / 1000.0f - modelVolts - emfCorrectionVolts);
+			}
 		}
 		const bool manualZero = currentSensorTakeZeroRequest();
 		const bool autoZero = currentZeroPending && trackSupplyAvailable &&
@@ -275,18 +351,28 @@ void vehicleControlTask(void *parameter) {
 			if (zeroOk || currentZeroTries >= CURRENT_ZERO_TRIES) {
 				currentZeroPending = false;
 			}
-			lastWakeTime = xTaskGetTickCount();
+			// Drop the ticks missed meanwhile.
+			ulTaskNotifyTake(pdTRUE, 0);
 		}
-		vTaskDelayUntil(&lastWakeTime, pdMS_TO_TICKS(CONTROL_PERIOD_MS));
+		if (!controlTimerRunning) {
+			vTaskDelay(1);
+		} else {
+			// Overruns collapse into one immediate cycle instead of a burst.
+			ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+		}
 	}
 }
 }
 
 void setup() {
+	adcSamplerBegin();
+	// First DMA frames arrive after 100 us; give all inputs a few.
+	delay(2);
 	btn9990Begin();
 	fullContactBegin();
 	currentSensorBegin();
 	backEmfBegin();
+	triggerSensorStart();
 	displayInit();
 	uint16_t triggerPermille = 0;
 	uint8_t sensiPercent = 0;

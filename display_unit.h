@@ -32,6 +32,17 @@ void displayGetWire(uint16_t *tenthFeet, uint8_t *limitPercent);
 uint16_t displayGetVoltageLimitMilliVolts();
 // BYPAS at full trigger: 0 = off, 1 = BTN 100 %, 2 = BTN 100 % plus FULL contact.
 uint8_t displayGetBypassMode();
+
+struct BipolarSettings {
+	float bandOhms;
+	float rbOhms;
+	float chokeOhms;
+	float sensiOhms;
+	float hfe;
+	float motorOhms;
+};
+// False if BIPOL is off for the selected car or MOTOR R has not been measured.
+bool displayGetBipolar(BipolarSettings *settings);
 void displayGetPwmFrequencies(uint32_t *driveHz, uint32_t *brakeHz);
 float expoCurve(float input, int16_t expo);
 DisplayMotorState displayGetMotorInputState();

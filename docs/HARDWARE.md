@@ -57,7 +57,7 @@ I2C-Adressen: FT3168 `0x38`, QMI8658 `0x6B` (Standard, ADO an 3V3). Beide teilen
 
 ### Trigger-Sensor (TLE493D)
 
-Der Magnetsensor wird getrennt vom Touch-Bus an `Wire1` betrieben:
+Der Magnetsensor wird getrennt vom Touch-Bus an I2C1 (ESP-IDF `i2c_master`) betrieben:
 
 | Signal | GPIO | Header-Pin |
 | --- | --- | --- |
@@ -67,7 +67,7 @@ Der Magnetsensor wird getrennt vom Touch-Bus an `Wire1` betrieben:
 | GND | GND | GND |
 
 Die Firmware erkennt die Varianten A0 (`0x35`) und P3 (`0x5D`) automatisch und liest den
-Triggerwinkel in Zehntelgrad auf jedem 1-ms-Regeltakt; die Anzeige und Touch-Auswertung laufen separat alle 10 ms. SDA/SCL-Pull-ups muessen auf 3V3 liegen; bei einem Sensormodul mit
+Triggerwinkel in Zehntelgrad jede Millisekunde in einem eigenen Task auf Core 0; die 2-kHz-Regelschleife auf Core 1 uebernimmt jeweils den letzten Wert, Anzeige und Touch-Auswertung laufen separat alle 10 ms. SDA/SCL-Pull-ups muessen auf 3V3 liegen (zusaetzlich sind die internen Pull-ups aktiv); bei einem Sensormodul mit
 integrierten Pull-ups keine zusaetzlichen Pull-ups bestuecken. GPIO8/15 sind damit fuer den
 TLE493D reserviert. Einzelne fehlgeschlagene I2C-Lesungen halten den letzten Winkel maximal 40 ms;
 bei laengerem Ausfall wird die Motorfreigabe gesperrt.
@@ -104,10 +104,12 @@ und manueller Nullpunkt (ZERO, nur mit losgelassenem Trigger).
 ### Gegen-EMK (Motorspannung)
 
 Wie im Referenzprojekt liegt die Motorspannung ueber 15 k / 2,2 k an GPIO 3. Alle 10 ms schaltet die
-Firmware beide BTN-Eingaenge kurz ab, wartet 25 us, misst und stellt den vorherigen Zustand wieder her
-(Fahren und Bremsen). Der Nullpunkt wird einmal nach 500 ms Stillstand mit weniger als 300 mV
-Schwankung gelernt und abgezogen. Bei hohem Motorstrom kann der Strom nach 25 us noch nicht
-abgeklungen sein; der Wert ist dann zu niedrig.
+Firmware beide BTN-Eingaenge kurz ab und misst, sobald der Wicklungsstrom abgeklungen ist: mindestens
+25 us, dann in 10-us-Schritten, bis der Wert die Diodenklemme (ca. 0 V beim Fahren, ca. VIN beim Bremsen)
+verlassen hat und zwei Messungen auf 150 mV uebereinstimmen, hoechstens 300 us. Danach wird der
+vorherige Zustand wiederhergestellt. Der Nullpunkt wird einmal nach 500 ms Stillstand mit weniger als
+300 mV Schwankung gelernt und abgezogen. Fuer BIPOL schaetzt die Regelung die EMK zusaetzlich jeden
+1-ms-Takt als D x VIN - I x R_A; jede BEMF-Messung gleicht den Versatz dieser Schaetzung nach.
 
 ### TF-Karte
 
@@ -224,10 +226,12 @@ Details:
   (`Arduino_SH8601` auf `Arduino_ESP32QSPI`, 80 MHz) mit Spaltenoffset 20; LVGL rendert
   partiell (nur geaenderte Bereiche, gerade ausgerichtet) und dreht die Bereiche beim Flush.
 - Touch: FT3168 per Polling ueber `Wire` (SDA 47, SCL 48, 300 kHz).
-- Trigger: TLE493D per `Wire1` auf GPIO8/15; Varianten A0/P3 werden ueber I2C-Adresse erkannt.
+- Trigger: TLE493D per ESP-IDF `i2c_master` (I2C1, GPIO8/15, 1 MHz, interne Pull-ups) in
+  eigenem Task auf Core 0 alle 1 ms; Varianten A0/P3 werden ueber I2C-Adresse erkannt.
 - Halbbruecke: BTN9990LV IN GPIO5, INH GPIO7, IS GPIO1; MCPWM startet gesperrt.
-- Spannungsmessung: `analogReadMilliVolts(4) * 3.0`, 8 Samples, alle 500 ms (`SUPPLY_*` in
-  `display_unit.cpp`).
+- Analogmessung: `adc_sampler.cpp`, ADC1 kontinuierlich per DMA (80 kS/s, Muster Strom,
+  Motor, VIN, Motor, Strom, Motor, VCC, Motor; Interrupt alle 100 us auf Core 0).
+- Regelschleife: 2 kHz (GPTimer, Core 1); Anzeige alle 10 ms auf Core 0.
 
 ## Links
 

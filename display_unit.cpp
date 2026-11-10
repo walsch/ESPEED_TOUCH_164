@@ -5,6 +5,7 @@
 #include "back_emf.h"
 #include "motor_resistance.h"
 #include "full_contact.h"
+#include "adc_sampler.h"
 
 #include <Arduino_GFX_Library.h>
 #define LV_CONF_INCLUDE_SIMPLE
@@ -30,10 +31,8 @@ constexpr uint8_t TOUCH_ADDRESS = 0x38;
 constexpr int8_t TOUCH_SDA = 47;
 constexpr int8_t TOUCH_SCL = 48;
 // BAT_ADC: VCC through 200K/100K divider -> Vcc = 3 * Vadc (≈4.9 V on USB, 3.3..4.2 V on battery)
-constexpr uint8_t SUPPLY_ADC_PIN = 4;
 constexpr uint8_t SUPPLY_DIVIDER = 3;
 constexpr uint32_t SUPPLY_SAMPLE_MS = 500;
-constexpr uint8_t TRACK_VIN_ADC_PIN = 2;
 constexpr uint32_t TRACK_DIVIDER_LOWER_OHMS = 2200;
 constexpr uint8_t TRACK_VOLTAGE_SAMPLE_COUNT = 8;
 constexpr uint32_t TRACK_VOLTAGE_SAMPLE_MS = 1;
@@ -450,6 +449,7 @@ enum class MenuPage : uint8_t {
   CurrentCalibration,
   MotorResistance,
   MotorKv,
+  Bipolar,
   TriggerCalibration,
   AssignSlot,
   Help,
@@ -701,6 +701,18 @@ uint16_t motorKv[CAR_COUNT] = {};
 // Reference DRAGM per car: false = DECL (only while releasing), true = CONT (always while driving).
 bool dragContinuous[CAR_COUNT] = {};
 bool editOriginalDragContinuous = false;
+// Emitter follower with motor feedback; resistances in 0.1 Ohm except the band.
+struct BipolarParams {
+  uint8_t enabled;
+  uint8_t bandOhms;
+  uint8_t rbTenthOhms;
+  uint8_t chokeTenthOhms;
+  uint16_t sensiTenthOhms;
+  uint8_t hfe;
+};
+constexpr BipolarParams BIPOLAR_DEFAULTS = {0, 50, 0, 0, 220, 50};
+BipolarParams bipolar[CAR_COUNT];
+BipolarParams bipolarOriginal = BIPOLAR_DEFAULTS;
 int32_t motorKvTargetRpm = 10000;
 int32_t displayedMotorKvBackEmf = -1;
 int32_t displayedMotorKvTargetRpm = -1;
@@ -802,12 +814,15 @@ void storeMotorData(uint8_t car) {
   prefs.putUShort(key, motorKv[car]);
   snprintf(key, sizeof(key), "dm%u", car);
   prefs.putBool(key, dragContinuous[car]);
+  snprintf(key, sizeof(key), "bp%u", car);
+  prefs.putBytes(key, &bipolar[car], sizeof(BipolarParams));
 }
 
 void clearMotorData(uint8_t car) {
   motorResistanceMilliOhms[car] = 0;
   motorKv[car] = 0;
   dragContinuous[car] = false;
+  bipolar[car] = BIPOLAR_DEFAULTS;
   storeMotorData(car);
 }
 
@@ -935,6 +950,10 @@ void initCars() {
     motorKv[car] = prefs.getUShort(key, 0);
     snprintf(key, sizeof(key), "dm%u", car);
     dragContinuous[car] = prefs.getBool(key, false);
+    snprintf(key, sizeof(key), "bp%u", car);
+    if (prefs.getBytes(key, &bipolar[car], sizeof(BipolarParams)) != sizeof(BipolarParams)) {
+      bipolar[car] = BIPOLAR_DEFAULTS;
+    }
   }
   TriggerCalibrationBlob calibration = {};
   const bool hasCalibration = preferencesReady &&
@@ -1129,6 +1148,8 @@ void printSettingValue(const SettingItem &item, int16_t x, int16_t y, uint16_t c
 
 // Grid position of a setting card, or -1 if it has no card (WLIM lives in the WIRE dialog).
 constexpr uint8_t SETTING_GRID_ORDER[] = {0, 1, 2, 4, 5, 9, 7, 8, 10, 11, 3};
+// The BIPOL card follows the setting cards; it opens its own dialog.
+constexpr uint8_t BIPOL_SLOT = sizeof(SETTING_GRID_ORDER);
 
 int8_t settingGridSlot(uint8_t index) {
   for (uint8_t slot = 0; slot < sizeof(SETTING_GRID_ORDER); slot++) {
@@ -1476,6 +1497,31 @@ void drawSettingsPage() {
       screen->setTextSize(1);
       screen->setCursor(x + SETTINGS_BUTTON_WIDTH - 8 - screen->textWidth(limit), y + 12);
       screen->print(limit);
+    }
+  }
+
+  {
+    const int16_t x = SETTINGS_GRID_LEFT + (BIPOL_SLOT / 2) * SETTINGS_COLUMN_STEP - settingsScroll;
+    const int16_t y = 56 + (BIPOL_SLOT % 2) * 92;
+    if (x >= 0 && x + SETTINGS_BUTTON_WIDTH <= 456) {
+      const BipolarParams &params = bipolar[selectedCar];
+      screen->fillRoundRect(x, y, SETTINGS_BUTTON_WIDTH, SETTINGS_BUTTON_HEIGHT, 12, COLOR_PANEL);
+      screen->drawRoundRect(x, y, SETTINGS_BUTTON_WIDTH, SETTINGS_BUTTON_HEIGHT, 12,
+                            params.enabled ? COLOR_ACCENT_WARM : COLOR_BORDER);
+      screen->setTextColor(COLOR_LABEL);
+      screen->setTextSize(3);
+      screen->setCursor(x + 12, y + 7);
+      screen->print("BIPOL");
+      screen->setTextColor(COLOR_TEXT);
+      screen->setTextSize(4);
+      screen->setCursor(x + 12, y + 43);
+      screen->print(params.enabled ? "ON" : "OFF");
+      if (params.enabled && motorResistanceMilliOhms[selectedCar] == 0) {
+        screen->setTextColor(COLOR_DANGER);
+        screen->setTextSize(1);
+        screen->setCursor(x + 84, y + 60);
+        screen->print("NEED R");
+      }
     }
   }
 
@@ -2392,6 +2438,94 @@ void drawMotorKvPage() {
   screen->print("MOTOR FREE, STEADY SPEED: SET RPM, SAVE (BEMF >= 1 V)");
 }
 
+constexpr int16_t BIPOLAR_ROW_TOP = 50;
+constexpr int16_t BIPOLAR_ROW_STEP = 46;
+constexpr int16_t BIPOLAR_ROW_HEIGHT = 43;
+constexpr int16_t BIPOLAR_BUTTON_X[] = {236, 288, 340, 392};
+constexpr int16_t BIPOLAR_BUTTON_WIDTH = 48;
+constexpr int8_t BIPOLAR_BUTTON_STEPS[] = {-2, -1, 1, 2};
+const char *const BIPOLAR_ROW_LABELS[] = {"BAND", "R_B", "CHOKE", "SENSI", "HFE"};
+constexpr uint8_t BIPOLAR_ROW_COUNT = 5;
+
+void formatBipolarValue(uint8_t row, char *text, size_t size) {
+  const BipolarParams &params = bipolar[selectedCar];
+  const uint16_t tenths[] = {0, params.rbTenthOhms, params.chokeTenthOhms, params.sensiTenthOhms};
+  if (row == 0) {
+    snprintf(text, size, "%u", params.bandOhms);
+  } else if (row == 4) {
+    snprintf(text, size, "%u", params.hfe);
+  } else {
+    snprintf(text, size, "%u.%u", tenths[row] / 10, tenths[row] % 10);
+  }
+}
+
+// steps: +-1 fine, +-2 coarse.
+void adjustBipolar(uint8_t row, int8_t steps) {
+  BipolarParams &params = bipolar[selectedCar];
+  const int16_t delta = (steps > 0 ? 1 : -1) * (abs(steps) == 2 ? 10 : 1);
+  switch (row) {
+    case 0: params.bandOhms = constrain(params.bandOhms + delta, 15, 220); break;
+    case 1: params.rbTenthOhms = constrain(params.rbTenthOhms + delta, 0, 100); break;
+    case 2: params.chokeTenthOhms = constrain(params.chokeTenthOhms + delta, 0, 100); break;
+    case 3: params.sensiTenthOhms = constrain(params.sensiTenthOhms + delta, 100, 350); break;
+    default: params.hfe = constrain(params.hfe + delta, 10, 250); break;
+  }
+}
+
+void drawBipolarPage() {
+  drawHeader("BIPOL");
+  const BipolarParams &params = bipolar[selectedCar];
+  screen->fillRoundRect(112, 6, 112, 34, 8, params.enabled ? COLOR_ACCENT_WARM : COLOR_PANEL);
+  // Red frame: enabled but MOTOR R missing, so the simulation cannot run.
+  screen->drawRoundRect(112, 6, 112, 34, 8,
+                        params.enabled && motorResistanceMilliOhms[selectedCar] == 0 ? COLOR_DANGER : COLOR_ACCENT_WARM);
+  screen->setTextColor(params.enabled ? COLOR_BG : COLOR_TEXT);
+  screen->setTextSize(2);
+  const char *state = !params.enabled ? "OFF" : motorResistanceMilliOhms[selectedCar] ? "ON" : "NEED R";
+  screen->setCursor(168 - screen->textWidth(state) / 2, 15);
+  screen->print(state);
+  screen->fillRoundRect(232, 6, 100, 34, 8, COLOR_PANEL);
+  screen->drawRoundRect(232, 6, 100, 34, 8, COLOR_DANGER);
+  screen->fillRoundRect(342, 6, 100, 34, 8, COLOR_PANEL);
+  screen->drawRoundRect(342, 6, 100, 34, 8, COLOR_ACCENT);
+  screen->setTextColor(COLOR_TEXT);
+  screen->setCursor(246, 15);
+  screen->print("CANCEL");
+  screen->setCursor(368, 15);
+  screen->print("SAVE");
+
+  const char *buttonText[] = {"--", "-", "+", "++"};
+  for (uint8_t row = 0; row < BIPOLAR_ROW_COUNT; row++) {
+    const int16_t y = BIPOLAR_ROW_TOP + row * BIPOLAR_ROW_STEP;
+    screen->fillRoundRect(8, y, 440, BIPOLAR_ROW_HEIGHT, 8, COLOR_PANEL);
+    screen->setTextColor(COLOR_LABEL);
+    screen->setTextSize(3);
+    screen->setCursor(18, y + 9);
+    screen->print(BIPOLAR_ROW_LABELS[row]);
+    char value[16];
+    formatBipolarValue(row, value, sizeof(value));
+    screen->setTextColor(COLOR_TEXT);
+    screen->setCursor(118, y + 9);
+    screen->print(value);
+    if (row < 4) {
+      const int16_t valueWidth = screen->textWidth(value);
+      screen->setTextColor(COLOR_LABEL);
+      screen->setTextSize(2);
+      screen->setCursor(118 + valueWidth + 6, y + 15);
+      screen->print("Ohm");
+      screen->setTextSize(3);
+      screen->setTextColor(COLOR_TEXT);
+    }
+    for (uint8_t button = 0; button < 4; button++) {
+      const int16_t bx = BIPOLAR_BUTTON_X[button];
+      screen->fillRoundRect(bx, y + 2, BIPOLAR_BUTTON_WIDTH, BIPOLAR_ROW_HEIGHT - 4, 6, COLOR_PANEL_ALT);
+      screen->drawRoundRect(bx, y + 2, BIPOLAR_BUTTON_WIDTH, BIPOLAR_ROW_HEIGHT - 4, 6, COLOR_BORDER);
+      screen->setCursor(bx + BIPOLAR_BUTTON_WIDTH / 2 - screen->textWidth(buttonText[button]) / 2, y + 9);
+      screen->print(buttonText[button]);
+    }
+  }
+}
+
 void updateMotorKvPage() {
   if (currentPage != MenuPage::MotorKv || welcomeVisible) {
     return;
@@ -2670,6 +2804,8 @@ void drawCurrentPage() {
     drawMotorResistancePage();
   } else if (currentPage == MenuPage::MotorKv) {
     drawMotorKvPage();
+  } else if (currentPage == MenuPage::Bipolar) {
+    drawBipolarPage();
   } else if (currentPage == MenuPage::TriggerCalibration) {
     drawTriggerCalibrationPage();
   } else if (currentPage == MenuPage::Help) {
@@ -2832,6 +2968,13 @@ void handleTouch(int16_t x, int16_t y) {
     } else if (x >= 322 && x < 442 && y < 50) {
       openCarMenu(true);
     } else if (y >= 55 && y < 238) {
+      const int16_t bipolX = SETTINGS_GRID_LEFT + (BIPOL_SLOT / 2) * SETTINGS_COLUMN_STEP - settingsScroll;
+      const int16_t bipolY = 56 + (BIPOL_SLOT % 2) * 92;
+      if (x >= bipolX && x < bipolX + SETTINGS_BUTTON_WIDTH &&
+          y >= bipolY && y < bipolY + SETTINGS_BUTTON_HEIGHT) {
+        bipolarOriginal = bipolar[selectedCar];
+        currentPage = MenuPage::Bipolar;
+      }
       for (uint8_t index = 0; index < sizeof(settings) / sizeof(settings[0]); index++) {
         const int8_t slot = settingGridSlot(index);
         if (slot < 0) {
@@ -3042,6 +3185,29 @@ void handleTouch(int16_t x, int16_t y) {
       vinCorrectionTargetMilliVolts = constrain(vinCorrectionTargetMilliVolts + delta, 0L, 30000L);
       drawCurrentPage();
     }
+    return;
+  }
+
+  if (currentPage == MenuPage::Bipolar) {
+    if (y < 50 && x >= 112 && x < 224) {
+      bipolar[selectedCar].enabled = !bipolar[selectedCar].enabled;
+    } else if (y < 50 && x >= 232 && x < 332) {
+      bipolar[selectedCar] = bipolarOriginal;
+      currentPage = MenuPage::Settings;
+    } else if (y < 50 && x >= 342 && x < 442) {
+      storeMotorData(selectedCar);
+      currentPage = MenuPage::Settings;
+    } else if (y >= BIPOLAR_ROW_TOP) {
+      const uint8_t row = (y - BIPOLAR_ROW_TOP) / BIPOLAR_ROW_STEP;
+      if (row < BIPOLAR_ROW_COUNT) {
+        for (uint8_t button = 0; button < 4; button++) {
+          if (x >= BIPOLAR_BUTTON_X[button] && x < BIPOLAR_BUTTON_X[button] + BIPOLAR_BUTTON_WIDTH) {
+            adjustBipolar(row, BIPOLAR_BUTTON_STEPS[button]);
+          }
+        }
+      }
+    }
+    drawCurrentPage();
     return;
   }
 
@@ -3303,6 +3469,7 @@ void handleTouch(int16_t x, int16_t y) {
       motorResistanceMilliOhms[destCar] = motorResistanceMilliOhms[sourceCar];
       motorKv[destCar] = motorKv[sourceCar];
       dragContinuous[destCar] = dragContinuous[sourceCar];
+      bipolar[destCar] = bipolar[sourceCar];
       storeMotorData(destCar);
       if (copyWithName) {
         strcpy(carNames[destCar], carNames[sourceCar]);
@@ -3498,15 +3665,14 @@ void updateCarsScrollAbsolute(int16_t x) {
 }
 
 uint16_t readSupplyVoltageMilliVolts() {
-  uint32_t sum = 0;
-  for (uint8_t i = 0; i < 8; i++) {
-    sum += analogReadMilliVolts(SUPPLY_ADC_PIN);
-  }
-  return (sum / 8) * SUPPLY_DIVIDER;
+  uint16_t milliVolts = 0;
+  adcSamplerRead(AdcInput::Supply, &milliVolts);
+  return milliVolts * SUPPLY_DIVIDER;
 }
 
 uint16_t readTrackVoltageMilliVolts() {
-  const uint32_t adcMilliVolts = analogReadMilliVolts(TRACK_VIN_ADC_PIN);
+  uint16_t adcMilliVolts = 0;
+  adcSamplerRead(AdcInput::TrackVoltage, &adcMilliVolts);
   const uint32_t dividerUpperOhms = configItems[CONFIG_VIN_DIVIDER].value
                                         ? 15000UL
                                         : 10000UL;
@@ -3624,6 +3790,21 @@ uint8_t displayGetBypassMode() {
   return constrain(__atomic_load_n(&settings[SETTING_BYPASS].value, __ATOMIC_RELAXED), 0, 2);
 }
 
+bool displayGetBipolar(BipolarSettings *out) {
+  const BipolarParams params = bipolar[selectedCar];
+  const uint32_t motorMilliOhms = motorResistanceMilliOhms[selectedCar];
+  if (!params.enabled || motorMilliOhms == 0) {
+    return false;
+  }
+  out->bandOhms = params.bandOhms;
+  out->rbOhms = params.rbTenthOhms / 10.0f;
+  out->chokeOhms = params.chokeTenthOhms / 10.0f;
+  out->sensiOhms = params.sensiTenthOhms / 10.0f;
+  out->hfe = params.hfe;
+  out->motorOhms = motorMilliOhms / 1000.0f;
+  return true;
+}
+
 void displayGetPwmFrequencies(uint32_t *driveHz, uint32_t *brakeHz) {
   *driveHz = __atomic_load_n(&settings[SETTING_PWM_FREQUENCY].value, __ATOMIC_RELAXED) * 100U;
   *brakeHz = __atomic_load_n(&settings[SETTING_BRAKE_FREQUENCY].value, __ATOMIC_RELAXED) * 100U;
@@ -3719,12 +3900,6 @@ void updateMotorCurrentDisplay() {
 
 void displayInit() {
   Wire.begin(TOUCH_SDA, TOUCH_SCL, 300000L);
-  analogReadResolution(12);
-  analogSetAttenuation(ADC_11db);
-  pinMode(TRACK_VIN_ADC_PIN, INPUT);
-  pinMode(SUPPLY_ADC_PIN, INPUT);
-  (void)analogReadMilliVolts(TRACK_VIN_ADC_PIN);
-  (void)analogReadMilliVolts(SUPPLY_ADC_PIN);
   supplyVoltageMilliVolts = readSupplyVoltageMilliVolts();
   supplySampledAt = millis();
   initCars();
