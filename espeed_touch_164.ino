@@ -22,8 +22,8 @@ constexpr uint32_t BACK_EMF_SAMPLE_MS = 10;
 // Reference BEMF_SETTLE_US: wait after switching off before reading.
 constexpr uint32_t BACK_EMF_SETTLE_US = 25;
 
-uint8_t applyExpo(uint8_t percent, int16_t expo) {
-	return static_cast<uint8_t>(expoCurve(percent / 100.0f, expo) * 100.0f + 0.5f);
+uint16_t applyExpo(uint16_t permille, int16_t expo) {
+	return static_cast<uint16_t>(expoCurve(permille / 1000.0f, expo) * 1000.0f + 0.5f);
 }
 
 void displayTask(void *parameter) {
@@ -47,6 +47,8 @@ void vehicleControlTask(void *parameter) {
 	uint32_t triggerSampleAt = 0;
 	bool previousTrackSupplyAvailable = false;
 	bool motorArmed = false;
+	uint16_t previousTriggerPermille = 0;
+	bool decelerating = false;
 	bool driving = false;
 	uint32_t standingSince = 0;
 	uint32_t vinPresentSince = 0;
@@ -70,11 +72,11 @@ void vehicleControlTask(void *parameter) {
 			triggerSensorUpdate();
 		}
 
-		uint8_t triggerPercent = 0;
+		uint16_t triggerPermille = 0;
 		uint8_t sensiPercent = 0;
 		uint8_t brakePercent = 100;
 		const bool controlInputValid = sensorInitialized &&
-			displayGetMotorControl(&triggerPercent, &sensiPercent, &brakePercent);
+			displayGetMotorControl(&triggerPermille, &sensiPercent, &brakePercent);
 		DisplayMotorState motorState = DisplayMotorState::Initializing;
 		if (!btn9990IsReady()) {
 			motorState = DisplayMotorState::DriverError;
@@ -82,7 +84,7 @@ void vehicleControlTask(void *parameter) {
 			motorState = DisplayMotorState::NoSensor;
 		} else if (!controlInputValid) {
 			motorState = displayGetMotorInputState();
-		} else if (triggerPercent == 0) {
+		} else if (triggerPermille == 0) {
 			motorState = trackSupplyAvailable ? DisplayMotorState::Braking : DisplayMotorState::NoVin;
 		} else if (!motorArmed) {
 			motorState = trackSupplyAvailable ? DisplayMotorState::LeaveBrake : DisplayMotorState::NoVin;
@@ -102,37 +104,56 @@ void vehicleControlTask(void *parameter) {
 		}
 
 		bool outputAccepted = true;
-		uint8_t commandedDutyPercent = 0;
+		uint32_t driveFrequencyHz;
+		uint32_t brakeFrequencyHz;
+		displayGetPwmFrequencies(&driveFrequencyHz, &brakeFrequencyHz);
+		btn9990SetFrequencies(driveFrequencyHz, brakeFrequencyHz);
+		uint16_t commandedDutyPermille = 0;
 		uint8_t testDutyPercent = 0;
 		if (motorResistanceUpdate(trackSupplyAvailable, displayTrackVoltageMilliVolts(), &testDutyPercent)) {
 			motorArmed = false;
 			motorState = DisplayMotorState::Driving;
-			commandedDutyPercent = testDutyPercent;
+			commandedDutyPermille = testDutyPercent * 10U;
 		} else if (!controlInputValid) {
 			motorArmed = false;
 			outputAccepted = btn9990SetBrakeDuty(brakePercent);
-			commandedDutyPercent = brakePercent;
-		} else if (triggerPercent == 0) {
+			commandedDutyPermille = brakePercent * 10U;
+		} else if (triggerPermille == 0) {
 			motorArmed = true;
 			outputAccepted = btn9990SetBrakeDuty(brakePercent);
-			commandedDutyPercent = brakePercent;
+			commandedDutyPermille = brakePercent * 10U;
 		} else if (!motorArmed) {
 			outputAccepted = btn9990SetBrakeDuty(brakePercent);
-			commandedDutyPercent = brakePercent;
+			commandedDutyPermille = brakePercent * 10U;
 		} else {
-			const uint8_t curvedPercent = applyExpo(triggerPercent, displayGetExpo());
-			const uint8_t throttlePercent = sensiPercent +
-				((100U - sensiPercent) * curvedPercent + 50U) / 100U;
-			commandedDutyPercent = throttlePercent;
-			if (!btn9990Enable() || !btn9990SetOutput(throttlePercent, 0)) {
-				outputAccepted = btn9990SetBrakeDuty(brakePercent);
-				commandedDutyPercent = brakePercent;
+			const uint16_t curvedPermille = applyExpo(triggerPermille, displayGetExpo());
+			const uint16_t sensiPermille = sensiPercent * 10U;
+			const uint16_t throttlePermille = sensiPermille +
+				((1000U - sensiPermille) * curvedPermille + 500U) / 1000U;
+			// Reference DRAGM DECL: drag only while the trigger is being released.
+			if (triggerPermille >= 1000) {
+				decelerating = false;
+			} else if (!decelerating && triggerPermille < previousTriggerPermille) {
+				decelerating = true;
+			} else if (decelerating && triggerPermille >= previousTriggerPermille) {
+				decelerating = false;
 			}
+			const uint16_t dragPermille = decelerating || displayGetDragContinuous()
+				? displayGetDragBrake() * 10U : 0;
+			commandedDutyPermille = throttlePermille;
+			if (!btn9990Enable() || !btn9990SetOutput(throttlePermille, dragPermille)) {
+				outputAccepted = btn9990SetBrakeDuty(brakePercent);
+				commandedDutyPermille = brakePercent * 10U;
+			}
+		}
+		previousTriggerPermille = controlInputValid ? triggerPermille : 0;
+		if (!btn9990IsOutputEnabled()) {
+			decelerating = false;
 		}
 		if (!outputAccepted) {
 			motorState = DisplayMotorState::DriverError;
 		}
-		displaySetMotorState(motorState, commandedDutyPercent);
+		displaySetMotorState(motorState, commandedDutyPermille);
 
 		const bool wasDriving = driving;
 		driving = btn9990IsOutputEnabled();
@@ -177,10 +198,10 @@ void setup() {
 	currentSensorBegin();
 	backEmfBegin();
 	displayInit();
-	uint8_t triggerPercent = 0;
+	uint16_t triggerPermille = 0;
 	uint8_t sensiPercent = 0;
 	uint8_t brakePercent = 100;
-	displayGetMotorControl(&triggerPercent, &sensiPercent, &brakePercent);
+	displayGetMotorControl(&triggerPermille, &sensiPercent, &brakePercent);
 	btn9990SetSupplyAvailable(false, brakePercent);
 	xTaskCreatePinnedToCore(displayTask, "Display", 8192, nullptr, 1, nullptr, 0);
 	xTaskCreatePinnedToCore(vehicleControlTask, "VehicleControl", 4096, nullptr, 2, nullptr, 1);

@@ -74,7 +74,7 @@ bool motorResistanceUpdate(bool supplyAvailable, uint16_t vinMilliVolts, uint8_t
   }
 
   const uint8_t duty = phase == 0 ? highDuty / 2 : highDuty;
-  if (!btn9990Enable() || !btn9990SetOutput(duty, 0)) {
+  if (!btn9990Enable() || !btn9990SetOutput(duty * 10U, 0)) {
     finish(MotorResistanceState::Failed);
     return false;
   }

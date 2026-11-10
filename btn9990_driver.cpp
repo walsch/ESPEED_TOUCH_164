@@ -6,8 +6,13 @@
 namespace {
 constexpr gpio_num_t BTN9990_IN_PIN = GPIO_NUM_5;
 constexpr gpio_num_t BTN9990_INH_PIN = GPIO_NUM_7;
-constexpr uint32_t MCPWM_RESOLUTION_HZ = 10000000;
-constexpr uint32_t MCPWM_PERIOD_TICKS = 333;
+// 40 MHz gives 0.075 % steps at 30 kHz but needs >= 611 Hz (16-bit period); below that 10 MHz.
+constexpr uint32_t RESOLUTION_FINE_HZ = 40000000;
+constexpr uint32_t RESOLUTION_COARSE_HZ = 10000000;
+constexpr uint32_t MAX_PERIOD_TICKS = 65535;
+constexpr uint32_t DEFAULT_FREQUENCY_HZ = 30000;
+constexpr uint32_t PWM_FREQUENCY_MIN_HZ = 200;
+constexpr uint32_t PWM_FREQUENCY_MAX_HZ = 50000;
 
 mcpwm_timer_handle_t pwmTimer = nullptr;
 mcpwm_oper_handle_t pwmOperator = nullptr;
@@ -21,8 +26,14 @@ bool driverReady = false;
 bool outputEnabled = false;
 bool brakeActive = false;
 uint8_t activeBrakeDuty = 100;
-uint8_t appliedInputDuty = 0;
-uint8_t appliedInhibitDuty = 0;
+// Applied duties in 0.1 % (0 ... 1000).
+uint16_t appliedInputDuty = 0;
+uint16_t appliedInhibitDuty = 0;
+uint32_t timerResolutionHz = RESOLUTION_FINE_HZ;
+bool fineResolutionAvailable = true;
+uint32_t periodTicks = RESOLUTION_FINE_HZ / DEFAULT_FREQUENCY_HZ;
+uint32_t driveFrequencyHz = DEFAULT_FREQUENCY_HZ;
+uint32_t brakeFrequencyHz = DEFAULT_FREQUENCY_HZ;
 
 void forcePinsLow() {
   digitalWrite(static_cast<uint8_t>(BTN9990_IN_PIN), LOW);
@@ -90,24 +101,58 @@ bool configureGenerator(mcpwm_gen_handle_t generator, mcpwm_cmpr_handle_t compar
 }
 
 bool setGeneratorDuty(mcpwm_gen_handle_t generator, mcpwm_cmpr_handle_t comparator,
-                      uint8_t duty) {
+                      uint16_t dutyPermille) {
   if (generator == inputGenerator) {
-    appliedInputDuty = duty;
+    appliedInputDuty = dutyPermille;
   } else {
-    appliedInhibitDuty = duty;
+    appliedInhibitDuty = dutyPermille;
   }
-  if (duty == 0) {
+  if (dutyPermille == 0) {
     return mcpwm_generator_set_force_level(generator, 0, true) == ESP_OK;
   }
-  if (duty == 255) {
+  if (dutyPermille >= 1000) {
     return mcpwm_generator_set_force_level(generator, 1, true) == ESP_OK;
   }
 
-  uint32_t compareTicks = (MCPWM_PERIOD_TICKS * duty + 127U) / 255U;
-  compareTicks = constrain(compareTicks, 1U, MCPWM_PERIOD_TICKS - 1U);
+  uint32_t compareTicks = (periodTicks * dutyPermille + 500U) / 1000U;
+  compareTicks = constrain(compareTicks, 1U, periodTicks - 1U);
   // A held force level is only released with hold_on=true.
   return mcpwm_comparator_set_compare_value(comparator, compareTicks) == ESP_OK &&
          mcpwm_generator_set_force_level(generator, -1, true) == ESP_OK;
+}
+
+bool applyFrequency(uint32_t frequencyHz) {
+  const uint32_t hz = constrain(frequencyHz, PWM_FREQUENCY_MIN_HZ, PWM_FREQUENCY_MAX_HZ);
+  const uint32_t resolution = fineResolutionAvailable && RESOLUTION_FINE_HZ / hz <= MAX_PERIOD_TICKS
+                                  ? RESOLUTION_FINE_HZ
+                                  : RESOLUTION_COARSE_HZ;
+  const uint32_t ticks = resolution / hz;
+  if (resolution == timerResolutionHz && ticks == periodTicks) {
+    return true;
+  }
+  if (resolution == timerResolutionHz) {
+    if (mcpwm_timer_set_period(pwmTimer, ticks) != ESP_OK) {
+      return false;
+    }
+    periodTicks = ticks;
+  } else {
+    // Resolution is fixed per timer: rebuild (~0.4 ms with both switches off).
+    const uint16_t inputDuty = appliedInputDuty;
+    const uint16_t inhibitDuty = appliedInhibitDuty;
+    const bool enabled = outputEnabled;
+    cleanupPwm();
+    timerResolutionHz = resolution;
+    periodTicks = ticks;
+    if (!btn9990Begin()) {
+      return false;
+    }
+    outputEnabled = enabled;
+    appliedInputDuty = inputDuty;
+    appliedInhibitDuty = inhibitDuty;
+  }
+  // Compare values scale with the period.
+  return setGeneratorDuty(inputGenerator, inputComparator, appliedInputDuty) &&
+         setGeneratorDuty(inhibitGenerator, inhibitComparator, appliedInhibitDuty);
 }
 }
 
@@ -119,16 +164,29 @@ bool btn9990Begin() {
   forcePinsLow();
 
 
-  const mcpwm_timer_config_t timerConfig = {
+  mcpwm_timer_config_t timerConfig = {
       .group_id = 0,
       .clk_src = MCPWM_TIMER_CLK_SRC_DEFAULT,
-      .resolution_hz = MCPWM_RESOLUTION_HZ,
+      .resolution_hz = timerResolutionHz,
       .count_mode = MCPWM_TIMER_COUNT_MODE_UP,
-      .period_ticks = MCPWM_PERIOD_TICKS,
+      .period_ticks = periodTicks,
+      .flags = {.update_period_on_empty = true},
   };
   if (mcpwm_new_timer(&timerConfig, &pwmTimer) != ESP_OK) {
-    cleanupPwm();
-    return false;
+    if (timerResolutionHz == RESOLUTION_COARSE_HZ) {
+      cleanupPwm();
+      return false;
+    }
+    const uint32_t hz = timerResolutionHz / periodTicks;
+    fineResolutionAvailable = false;
+    timerResolutionHz = RESOLUTION_COARSE_HZ;
+    periodTicks = RESOLUTION_COARSE_HZ / hz;
+    timerConfig.resolution_hz = timerResolutionHz;
+    timerConfig.period_ticks = periodTicks;
+    if (mcpwm_new_timer(&timerConfig, &pwmTimer) != ESP_OK) {
+      cleanupPwm();
+      return false;
+    }
   }
 
   const mcpwm_operator_config_t operatorConfig = {.group_id = 0};
@@ -161,8 +219,8 @@ bool btn9990Begin() {
     return false;
   }
 
-  if (mcpwm_comparator_set_compare_value(inputComparator, MCPWM_PERIOD_TICKS / 2) != ESP_OK ||
-      mcpwm_comparator_set_compare_value(inhibitComparator, MCPWM_PERIOD_TICKS / 2) != ESP_OK ||
+  if (mcpwm_comparator_set_compare_value(inputComparator, periodTicks / 2) != ESP_OK ||
+      mcpwm_comparator_set_compare_value(inhibitComparator, periodTicks / 2) != ESP_OK ||
       mcpwm_timer_enable(pwmTimer) != ESP_OK) {
     cleanupPwm();
     return false;
@@ -217,7 +275,8 @@ bool btn9990SetBrakeDuty(uint8_t brakePercent) {
     brakePercent = 100;
   }
   activeBrakeDuty = brakePercent;
-  const uint8_t inhibitDuty = static_cast<uint16_t>(brakePercent) * 255U / 100U;
+  applyFrequency(brakeFrequencyHz);
+  const uint16_t inhibitDuty = static_cast<uint16_t>(brakePercent) * 10U;
   if (!setGeneratorDuty(inputGenerator, inputComparator, 0) ||
       !setGeneratorDuty(inhibitGenerator, inhibitComparator, inhibitDuty)) {
     btn9990Disable();
@@ -233,22 +292,21 @@ void btn9990SetSupplyAvailable(bool available, uint8_t brakePercent) {
   }
 }
 
-bool btn9990SetOutput(uint8_t throttlePercent, uint8_t dragPercent) {
+bool btn9990SetOutput(uint16_t throttlePermille, uint16_t dragPermille) {
   if (!driverReady) {
     return false;
   }
   if (!outputEnabled) {
     return false;
   }
-  if (throttlePercent > 100 || dragPercent > 100) {
+  if (throttlePermille > 1000 || dragPermille > 1000) {
     btn9990SetBrakeDuty(100);
     return false;
   }
 
-  const uint8_t inputDuty = static_cast<uint16_t>(throttlePercent) * 255U / 100U;
-  const uint16_t dragDuty = static_cast<uint16_t>(dragPercent) * 255U / 100U;
-  const uint8_t inhibitDuty = (inputDuty + dragDuty > 255U) ? 255U : inputDuty + dragDuty;
-  if (!setGeneratorDuty(inputGenerator, inputComparator, inputDuty) ||
+  const uint16_t inhibitDuty = min<uint16_t>(1000, throttlePermille + dragPermille);
+  applyFrequency(driveFrequencyHz);
+  if (!setGeneratorDuty(inputGenerator, inputComparator, throttlePermille) ||
       !setGeneratorDuty(inhibitGenerator, inhibitComparator, inhibitDuty)) {
     btn9990SetBrakeDuty(100);
     return false;
@@ -263,6 +321,11 @@ bool btn9990IsReady() {
 
 bool btn9990IsOutputEnabled() {
   return outputEnabled;
+}
+
+void btn9990SetFrequencies(uint32_t driveHz, uint32_t brakeHz) {
+  driveFrequencyHz = driveHz;
+  brakeFrequencyHz = brakeHz;
 }
 
 void btn9990PauseOutput() {

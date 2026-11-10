@@ -68,8 +68,8 @@ int16_t touchYForLvgl = 0;
 bool displayReady = false;
 DisplayMotorState motorState = DisplayMotorState::Initializing;
 DisplayMotorState displayedMotorState = DisplayMotorState::Initializing;
-uint8_t motorDutyPercent = 0;
-uint8_t displayedMotorDutyPercent = UINT8_MAX;
+uint16_t motorDutyPermille = 0;
+uint16_t displayedMotorDutyPermille = UINT16_MAX;
 
 class LvglCanvas {
 public:
@@ -188,6 +188,15 @@ public:
     textX = x;
     textY = y;
     textBuffer[0] = '\0';
+  }
+
+  // Pixel width of text in the current text size.
+  int16_t textWidth(const char *text) const {
+    int32_t width = 0;
+    for (const char *c = text; *c; c++) {
+      width += lv_font_get_glyph_width(textFont, (uint8_t)c[0], (uint8_t)c[1]);
+    }
+    return width;
   }
 
   void print(const char *text) { appendText(text); }
@@ -567,8 +576,8 @@ bool calibrationCandidateIsValid() {
                                    wrapTriggerAngle(calibrationFullAngle - calibrationRestAngle));
 }
 
-bool mapTriggerAngleToPercent(int16_t angle, int16_t rest, int16_t travel,
-                              uint8_t deadbandPercent, uint8_t &percent) {
+bool mapTriggerAngleToPermille(int16_t angle, int16_t rest, int16_t travel,
+                               uint8_t deadbandPercent, uint16_t &permille) {
   if (angle < 0 || angle >= TRIGGER_ANGLE_FULL || !triggerCalibrationIsValid(rest, travel)) {
     return false;
   }
@@ -579,13 +588,24 @@ bool mapTriggerAngleToPercent(int16_t angle, int16_t rest, int16_t travel,
   }
   const int32_t deadband = (span * deadbandPercent + 50) / 100;
   if (position <= deadband) {
-    percent = 0;
+    permille = 0;
   } else if (position >= span - deadband) {
-    percent = 100;
+    permille = 1000;
   } else {
     const int32_t activeSpan = span - 2 * deadband;
-    percent = ((position - deadband) * 100 + activeSpan / 2) / activeSpan;
+    // Keep any movement past the deadband above zero so it is not read as brake.
+    permille = max<int32_t>(1, ((position - deadband) * 1000 + activeSpan / 2) / activeSpan);
   }
+  return true;
+}
+
+bool mapTriggerAngleToPercent(int16_t angle, int16_t rest, int16_t travel,
+                              uint8_t deadbandPercent, uint8_t &percent) {
+  uint16_t permille;
+  if (!mapTriggerAngleToPermille(angle, rest, travel, deadbandPercent, permille)) {
+    return false;
+  }
+  percent = (permille + 5) / 10;
   return true;
 }
 
@@ -620,9 +640,11 @@ SettingItem settings[] = {
     {"WIRE", 0, 0, 250, 'f'},
     {"WLIM", 99, 0, 100, '%'},
     {"CURVE", 50, 10, 90, '%'},
-    {"PWM_F", 15, 10, 250, 'k'},
+    {"PWM_F", 300, 2, 500, 'k'},
     {"LIMIT", 100, 5, 100, '%'},
     {"BYPAS", 0, 0, 1, ' '},
+    // Brake PWM: a low frequency limits regeneration into supplies that cannot sink current.
+    {"BRK_F", 2, 2, 500, 'k'},
 };
 
 char carNames[][CAR_NAME_LENGTH + 1] = {
@@ -668,6 +690,9 @@ MotorResistanceState displayedMotorResistanceState = MotorResistanceState::Idle;
 uint32_t motorResistanceDisplayUpdatedAt = 0;
 // Motor constant per car in rpm/V; 0 = unknown (status bar then shows BEMF instead of RPM).
 uint16_t motorKv[CAR_COUNT] = {};
+// Reference DRAGM per car: false = DECL (only while releasing), true = CONT (always while driving).
+bool dragContinuous[CAR_COUNT] = {};
+bool editOriginalDragContinuous = false;
 int32_t motorKvTargetRpm = 10000;
 int32_t displayedMotorKvBackEmf = -1;
 int32_t displayedMotorKvTargetRpm = -1;
@@ -690,6 +715,15 @@ int16_t settingDefaults[SETTING_COUNT];
 struct CarBlob {
   char name[CAR_NAME_LENGTH + 1];
   int16_t values[SETTING_COUNT];
+  int16_t curveX;
+};
+// Profiles stored before BRK_F was added (PWM_F was then unused, in kHz).
+constexpr uint8_t LEGACY_SETTING_COUNT = 11;
+constexpr uint8_t SETTING_PWM_FREQUENCY = 8;
+constexpr uint8_t SETTING_BRAKE_FREQUENCY = 11;
+struct LegacyCarBlob {
+  char name[CAR_NAME_LENGTH + 1];
+  int16_t values[LEGACY_SETTING_COUNT];
   int16_t curveX;
 };
 struct TriggerCalibrationBlob {
@@ -751,11 +785,14 @@ void storeMotorData(uint8_t car) {
   prefs.putUInt(key, motorResistanceMilliOhms[car]);
   snprintf(key, sizeof(key), "kv%u", car);
   prefs.putUShort(key, motorKv[car]);
+  snprintf(key, sizeof(key), "dm%u", car);
+  prefs.putBool(key, dragContinuous[car]);
 }
 
 void clearMotorData(uint8_t car) {
   motorResistanceMilliOhms[car] = 0;
   motorKv[car] = 0;
+  dragContinuous[car] = false;
   storeMotorData(car);
 }
 
@@ -817,14 +854,24 @@ void initCars() {
   for (uint8_t car = 0; car < CAR_COUNT; car++) {
     CarBlob blob;
     carKey(car, key, sizeof(key));
-    if (valid && prefs.getBytes(key, &blob, sizeof(blob)) == sizeof(blob)) {
+    const size_t storedLength = valid ? prefs.getBytesLength(key) : 0;
+    if (storedLength == sizeof(blob) && prefs.getBytes(key, &blob, sizeof(blob)) == sizeof(blob)) {
       blob.name[CAR_NAME_LENGTH] = '\0';
       strcpy(carNames[car], blob.name);
       memcpy(carValues[car], blob.values, sizeof(blob.values));
       carCurveX[car] = blob.curveX;
+    } else if (storedLength == sizeof(LegacyCarBlob)) {
+      LegacyCarBlob legacy;
+      if (prefs.getBytes(key, &legacy, sizeof(legacy)) == sizeof(legacy)) {
+        legacy.name[CAR_NAME_LENGTH] = '\0';
+        strcpy(carNames[car], legacy.name);
+        memcpy(carValues[car], legacy.values, sizeof(legacy.values));
+        carValues[car][SETTING_PWM_FREQUENCY] = settingDefaults[SETTING_PWM_FREQUENCY];
+        carCurveX[car] = legacy.curveX;
+      }
     }
     fillBlob(car, savedBlobs[car]);
-    if (!valid) {
+    if (!valid || storedLength != sizeof(CarBlob)) {
       prefs.putBytes(key, &savedBlobs[car], sizeof(CarBlob));
     }
   }
@@ -850,6 +897,8 @@ void initCars() {
     motorResistanceMilliOhms[car] = prefs.getUInt(key, 0);
     snprintf(key, sizeof(key), "kv%u", car);
     motorKv[car] = prefs.getUShort(key, 0);
+    snprintf(key, sizeof(key), "dm%u", car);
+    dragContinuous[car] = prefs.getBool(key, false);
   }
   TriggerCalibrationBlob calibration = {};
   const bool hasCalibration = preferencesReady &&
@@ -1017,11 +1066,11 @@ uint16_t motorStateColor(DisplayMotorState state) {
 
 void drawMotorStatusBadge() {
   const DisplayMotorState state = __atomic_load_n(&motorState, __ATOMIC_ACQUIRE);
-  const uint8_t duty = __atomic_load_n(&motorDutyPercent, __ATOMIC_RELAXED);
+  const uint16_t duty = __atomic_load_n(&motorDutyPermille, __ATOMIC_RELAXED);
   char label[24];
   if (state == DisplayMotorState::Driving || state == DisplayMotorState::DrivingLowVin ||
       state == DisplayMotorState::Braking) {
-    snprintf(label, sizeof(label), "%s %u%%", motorStateLabel(state), duty);
+    snprintf(label, sizeof(label), "%s %u%%", motorStateLabel(state), (duty + 5) / 10);
   } else {
     snprintf(label, sizeof(label), "%s", motorStateLabel(state));
   }
@@ -1032,10 +1081,17 @@ void drawMotorStatusBadge() {
   screen->setCursor(249 - (strlen(label) * 6) / 2, 19);
   screen->print(label);
   displayedMotorState = state;
-  displayedMotorDutyPercent = duty;
+  displayedMotorDutyPermille = duty;
 }
 
-void printSettingValue(const SettingItem &item, int16_t x, int16_t y);
+void printSettingValue(const SettingItem &item, int16_t x, int16_t y, uint16_t color = COLOR_TEXT);
+
+// Only these settings act on the motor so far; the others are shown grayed out.
+bool settingImplemented(uint8_t index) {
+  const char *name = settings[index].name;
+  return strcmp(name, "BRAKE") == 0 || strcmp(name, "SENSI") == 0 || strcmp(name, "EXPO") == 0 ||
+         strcmp(name, "DRAGB") == 0 || strcmp(name, "PWM_F") == 0 || strcmp(name, "BRK_F") == 0;
+}
 
 void statusCardRect(uint8_t card, int16_t &x, int16_t &y) {
   x = (card % 2 == 0) ? STATUS_LEFT_X : STATUS_RIGHT_X;
@@ -1155,8 +1211,8 @@ bool currentElectricalPowerDeciWatts(int32_t *deciWatts) {
     return true;
   }
   const int64_t vin = __atomic_load_n(&trackVoltageMilliVolts, __ATOMIC_RELAXED);
-  const int64_t duty = __atomic_load_n(&motorDutyPercent, __ATOMIC_RELAXED);
-  *deciWatts = (int32_t)(vin * duty * milliAmps / 10000000LL);
+  const int64_t duty = __atomic_load_n(&motorDutyPermille, __ATOMIC_RELAXED);
+  *deciWatts = (int32_t)(vin * duty * milliAmps / 100000000LL);
   return true;
 }
 
@@ -1254,14 +1310,18 @@ void drawStatusPage() {
   printTrackVoltage();
 }
 
-void printSettingValue(const SettingItem &item, int16_t x, int16_t y) {
-  screen->setTextColor(COLOR_TEXT);
+void printSettingValue(const SettingItem &item, int16_t x, int16_t y, uint16_t color) {
+  screen->setTextColor(color);
   screen->setTextSize(4);
   screen->setCursor(x, y);
   if (item.name[0] == 'B' && item.name[1] == 'Y') {
     screen->print(item.value ? "ON" : "OFF");
   } else if (strcmp(item.name, "VINDIV") == 0) {
     screen->print(item.value ? "15K" : "10K");
+  } else if (item.unit == 'k') {
+    char text[12];
+    snprintf(text, sizeof(text), "%d.%dk", item.value / 10, item.value % 10);
+    screen->print(text);
   } else {
     screen->print(item.value);
     if (item.unit != ' ') {
@@ -1321,14 +1381,22 @@ void drawSettingsPage() {
     if (x < 0 || x + SETTINGS_BUTTON_WIDTH > 456) {
       continue;
     }
-    screen->fillRoundRect(x, y, SETTINGS_BUTTON_WIDTH, SETTINGS_BUTTON_HEIGHT, 12, COLOR_PANEL);
-    screen->drawRoundRect(x, y, SETTINGS_BUTTON_WIDTH, SETTINGS_BUTTON_HEIGHT, 12, COLOR_BORDER);
+    const bool enabled = settingImplemented(index);
+    screen->fillRoundRect(x, y, SETTINGS_BUTTON_WIDTH, SETTINGS_BUTTON_HEIGHT, 12, enabled ? COLOR_PANEL : COLOR_BG);
+    screen->drawRoundRect(x, y, SETTINGS_BUTTON_WIDTH, SETTINGS_BUTTON_HEIGHT, 12, enabled ? COLOR_BORDER : COLOR_TRACK);
     // label 24px + value 32px fill the 82px card with ~7px margins
-    screen->setTextColor(COLOR_LABEL);
+    screen->setTextColor(enabled ? COLOR_LABEL : COLOR_TRACK);
     screen->setTextSize(3);
     screen->setCursor(x + 12, y + 7);
     screen->print(settings[index].name);
-    printSettingValue(settings[index], x + 12, y + 43);
+    printSettingValue(settings[index], x + 12, y + 43, enabled ? COLOR_TEXT : COLOR_TRACK);
+    if (strcmp(settings[index].name, "DRAGB") == 0 && dragContinuous[selectedCar]) {
+      screen->fillRoundRect(x + 108, y + 8, 34, 16, 4, COLOR_ACCENT_WARM);
+      screen->setTextColor(COLOR_BG);
+      screen->setTextSize(1);
+      screen->setCursor(x + 125 - screen->textWidth("CONT") / 2, y + 11);
+      screen->print("CONT");
+    }
   }
 
   screen->fillRoundRect(14, 240, 428, 34, 8, COLOR_PANEL);
@@ -1356,6 +1424,17 @@ void drawEditPage() {
   screen->setCursor(368, 15);
   screen->print("SAVE");
 
+  if (strcmp(item.name, "DRAGB") == 0) {
+    const bool continuous = dragContinuous[selectedCar];
+    screen->fillRoundRect(122, 6, 100, 34, 8, continuous ? COLOR_ACCENT_WARM : COLOR_PANEL);
+    screen->drawRoundRect(122, 6, 100, 34, 8, COLOR_ACCENT_WARM);
+    screen->setTextColor(continuous ? COLOR_BG : COLOR_TEXT);
+    screen->setTextSize(2);
+    const char *mode = continuous ? "CONT" : "DECL";
+    screen->setCursor(172 - screen->textWidth(mode) / 2, 15);
+    screen->print(mode);
+  }
+
   const bool hasGraph = strcmp(item.name, "CURVE") == 0 || strcmp(item.name, "EXPO") == 0;
   const bool isToggle = item.name[0] == 'B' && item.name[1] == 'Y';
   if (hasGraph) {
@@ -1371,6 +1450,9 @@ void drawEditPage() {
     char range[32];
     if (isToggle) {
       snprintf(range, sizeof(range), "OFF - ON");
+    } else if (item.unit == 'k') {
+      snprintf(range, sizeof(range), "%d.%dk - %d.%dk", item.minimum / 10, item.minimum % 10,
+               item.maximum / 10, item.maximum % 10);
     } else if (item.unit != ' ') {
       snprintf(range, sizeof(range), "%d%c - %d%c", item.minimum, item.unit, item.maximum, item.unit);
     } else {
@@ -1384,6 +1466,8 @@ void drawEditPage() {
     char value[8];
     if (isToggle) {
       snprintf(value, sizeof(value), "%s", item.value ? "ON" : "OFF");
+    } else if (item.unit == 'k') {
+      snprintf(value, sizeof(value), "%d.%d", item.value / 10, item.value % 10);
     } else {
       snprintf(value, sizeof(value), "%d", item.value);
     }
@@ -1506,6 +1590,23 @@ void drawCarsPage() {
 
 void formatMilliOhms(uint32_t milliOhms, char *text, size_t textSize);
 
+constexpr int16_t CAR_OPTION_LEFT = 12;
+constexpr int16_t CAR_OPTION_TOP = 54;
+constexpr int16_t CAR_OPTION_WIDTH = 140;
+constexpr int16_t CAR_OPTION_HEIGHT = 104;
+constexpr int16_t CAR_OPTION_GAP = 6;
+
+int8_t carOptionAt(int16_t x, int16_t y) {
+  for (uint8_t i = 0; i < 6; i++) {
+    const int16_t bx = CAR_OPTION_LEFT + (i % 3) * (CAR_OPTION_WIDTH + CAR_OPTION_GAP);
+    const int16_t by = CAR_OPTION_TOP + (i / 3) * (CAR_OPTION_HEIGHT + CAR_OPTION_GAP);
+    if (x >= bx && x < bx + CAR_OPTION_WIDTH && y >= by && y < by + CAR_OPTION_HEIGHT) {
+      return i;
+    }
+  }
+  return -1;
+}
+
 void drawCarOptionsPage() {
   drawHeader("CAR");
   screen->fillRoundRect(342, 6, 100, 34, 8, COLOR_PANEL);
@@ -1515,12 +1616,14 @@ void drawCarOptionsPage() {
   screen->setCursor(368, 15);
   screen->print("BACK");
 
+  screen->setTextSize(3);
+  const int16_t nameX = 20 + screen->textWidth("CAR") + 16;
   screen->setTextColor(COLOR_ACCENT_WARM);
-  screen->setTextSize(4);
-  screen->setCursor((456 - (int16_t)strlen(carNames[selectedCar]) * 24) / 2, 62);
+  screen->setCursor(nameX, 11);
   screen->print(carNames[selectedCar]);
 
-  const char *labels[] = {"RENAME", "COPY", "RESTORE", "MOTOR R", "MOTOR KV", "DEFAULTS"};
+  const char *labels[][2] = {{"RENAME", nullptr}, {"COPY", nullptr}, {"RESTORE", nullptr},
+                             {"MOTOR", "R"}, {"MOTOR", "KV"}, {"DEFAULTS", nullptr}};
   const uint16_t colors[] = {COLOR_ACCENT, COLOR_ACCENT_WARM, COLOR_LABEL,
                              COLOR_ACCENT, COLOR_ACCENT_WARM, COLOR_DANGER};
   char values[2][16] = {"NOT MEASURED", "NOT SET"};
@@ -1531,22 +1634,26 @@ void drawCarOptionsPage() {
     snprintf(values[1], sizeof(values[1]), "%u RPM/V", motorKv[selectedCar]);
   }
   for (uint8_t i = 0; i < 6; i++) {
-    const int16_t x = 20 + (i % 3) * 142;
-    const int16_t y = (i < 3) ? 116 : 196;
-    screen->fillRoundRect(x, y, 132, 66, 12, COLOR_PANEL);
-    screen->drawRoundRect(x, y, 132, 66, 12, colors[i]);
+    const int16_t x = CAR_OPTION_LEFT + (i % 3) * (CAR_OPTION_WIDTH + CAR_OPTION_GAP);
+    const int16_t y = CAR_OPTION_TOP + (i / 3) * (CAR_OPTION_HEIGHT + CAR_OPTION_GAP);
+    screen->fillRoundRect(x, y, CAR_OPTION_WIDTH, CAR_OPTION_HEIGHT, 12, COLOR_PANEL);
+    screen->drawRoundRect(x, y, CAR_OPTION_WIDTH, CAR_OPTION_HEIGHT, 12, colors[i]);
     screen->setTextColor(COLOR_TEXT);
-    screen->setTextSize(2);
-    const bool hasValue = i == 3 || i == 4;
-    screen->setCursor(x + (132 - (int16_t)strlen(labels[i]) * 10) / 2, y + (hasValue ? 14 : 24));
-    screen->print(labels[i]);
-    if (hasValue) {
-      const char *value = values[i - 3];
-      screen->setTextColor(COLOR_LABEL);
-      screen->setTextSize(1);
-      screen->setCursor(x + (132 - (int16_t)strlen(value) * 6) / 2, y + 42);
-      screen->print(value);
+    screen->setTextSize(3);
+    if (!labels[i][1]) {
+      screen->setCursor(x + (CAR_OPTION_WIDTH - screen->textWidth(labels[i][0])) / 2, y + 38);
+      screen->print(labels[i][0]);
+      continue;
     }
+    for (uint8_t line = 0; line < 2; line++) {
+      screen->setCursor(x + (CAR_OPTION_WIDTH - screen->textWidth(labels[i][line])) / 2, y + 10 + line * 28);
+      screen->print(labels[i][line]);
+    }
+    const char *value = values[i - 3];
+    screen->setTextColor(COLOR_LABEL);
+    screen->setTextSize(2);
+    screen->setCursor(x + (CAR_OPTION_WIDTH - screen->textWidth(value)) / 2, y + 76);
+    screen->print(value);
   }
 }
 
@@ -2617,9 +2724,13 @@ void handleTouch(int16_t x, int16_t y) {
         const int16_t cardY = 56 + (index % 2) * 92;
         if (x >= cardX && x < cardX + SETTINGS_BUTTON_WIDTH &&
             y >= cardY && y < cardY + SETTINGS_BUTTON_HEIGHT) {
+          if (!settingImplemented(index)) {
+            break;
+          }
           selectedSetting = index;
           editingConfig = false;
           editOriginalValue = settings[index].value;
+          editOriginalDragContinuous = dragContinuous[selectedCar];
           if (strcmp(settings[index].name, "CURVE") == 0) {
             curveOriginalX = curveXValue;
             curveOriginalY = settings[index].value;
@@ -2636,9 +2747,23 @@ void handleTouch(int16_t x, int16_t y) {
   }
 
   if (currentPage == MenuPage::Edit) {
+    if (!editingConfig && strcmp(editItem().name, "DRAGB") == 0 && y < 50 && x >= 122 && x < 222) {
+      dragContinuous[selectedCar] = !dragContinuous[selectedCar];
+      drawCurrentPage();
+      return;
+    }
     const bool cancelTap = x >= 232 && x < 332 && y < 50;
     const bool saveTap = x >= 342 && x < 442 && y < 50;
     if (cancelTap || saveTap) {
+      if (!editingConfig && strcmp(editItem().name, "DRAGB") == 0) {
+        if (cancelTap) {
+          dragContinuous[selectedCar] = editOriginalDragContinuous;
+        } else if (dragContinuous[selectedCar] != editOriginalDragContinuous) {
+          char key[8];
+          snprintf(key, sizeof(key), "dm%u", selectedCar);
+          prefs.putBool(key, dragContinuous[selectedCar]);
+        }
+      }
       if (cancelTap) {
         editItem().value = editOriginalValue;
         if (strcmp(editItem().name, "CURVE") == 0) {
@@ -2932,20 +3057,21 @@ void handleTouch(int16_t x, int16_t y) {
       drawCurrentPage();
       return;
     }
-    if (y >= 116 && y < 182 && x >= 20 && x < 152) {
+    const int8_t option = carOptionAt(x, y);
+    if (option == 0) {
       openCarEdit();
       drawCurrentPage();
-    } else if (y >= 116 && y < 182 && x >= 162 && x < 294) {
+    } else if (option == 1) {
       openCarCopy(false);
       drawCurrentPage();
-    } else if (y >= 116 && y < 182 && x >= 304 && x < 436) {
+    } else if (option == 2) {
       openCarCopy(true);
       drawCurrentPage();
-    } else if (y >= 196 && y < 262 && x >= 20 && x < 152) {
+    } else if (option == 3) {
       motorResistanceDisplayUpdatedAt = 0;
       currentPage = MenuPage::MotorResistance;
       drawCurrentPage();
-    } else if (y >= 196 && y < 262 && x >= 162 && x < 294) {
+    } else if (option == 4) {
       uint16_t backEmf;
       const uint16_t kv = motorKv[selectedCar];
       motorKvTargetRpm = kv && backEmfGetMilliVolts(&backEmf) && backEmf >= 1000
@@ -2954,7 +3080,7 @@ void handleTouch(int16_t x, int16_t y) {
       motorKvDisplayUpdatedAt = 0;
       currentPage = MenuPage::MotorKv;
       drawCurrentPage();
-    } else if (y >= 196 && y < 262 && x >= 304 && x < 436) {
+    } else if (option == 5) {
       currentPage = MenuPage::CarDefaultsConfirm;
       drawCurrentPage();
     }
@@ -3043,6 +3169,7 @@ void handleTouch(int16_t x, int16_t y) {
       carCurveX[destCar] = carCurveX[sourceCar];
       motorResistanceMilliOhms[destCar] = motorResistanceMilliOhms[sourceCar];
       motorKv[destCar] = motorKv[sourceCar];
+      dragContinuous[destCar] = dragContinuous[sourceCar];
       storeMotorData(destCar);
       if (copyWithName) {
         strcpy(carNames[destCar], carNames[sourceCar]);
@@ -3320,9 +3447,9 @@ uint16_t displayTrackVoltageMilliVolts() {
   return __atomic_load_n(&trackVoltageMilliVolts, __ATOMIC_RELAXED);
 }
 
-bool displayGetMotorControl(uint8_t *triggerPercent, uint8_t *sensiPercent,
+bool displayGetMotorControl(uint16_t *triggerPermille, uint8_t *sensiPercent,
                             uint8_t *brakePercent) {
-  if (!triggerPercent || !sensiPercent || !brakePercent) {
+  if (!triggerPermille || !sensiPercent || !brakePercent) {
     return false;
   }
   *sensiPercent = constrain(__atomic_load_n(&settings[1].value, __ATOMIC_RELAXED), 0, 100);
@@ -3336,11 +3463,24 @@ bool displayGetMotorControl(uint8_t *triggerPercent, uint8_t *sensiPercent,
   const int16_t travel = __atomic_load_n(&triggerCalibrationTravel, __ATOMIC_RELAXED);
   uint8_t deadband = constrain(__atomic_load_n(&configItems[CONFIG_DEADBAND].value,
                                                 __ATOMIC_RELAXED), 0, 20);
-  return mapTriggerAngleToPercent(angle, rest, travel, deadband, *triggerPercent);
+  return mapTriggerAngleToPermille(angle, rest, travel, deadband, *triggerPermille);
 }
 
 int16_t displayGetExpo() {
   return constrain(__atomic_load_n(&settings[2].value, __ATOMIC_RELAXED), -100, 100);
+}
+
+uint8_t displayGetDragBrake() {
+  return constrain(__atomic_load_n(&settings[4].value, __ATOMIC_RELAXED), 0, 100);
+}
+
+bool displayGetDragContinuous() {
+  return __atomic_load_n(&dragContinuous[selectedCar], __ATOMIC_RELAXED);
+}
+
+void displayGetPwmFrequencies(uint32_t *driveHz, uint32_t *brakeHz) {
+  *driveHz = __atomic_load_n(&settings[SETTING_PWM_FREQUENCY].value, __ATOMIC_RELAXED) * 100U;
+  *brakeHz = __atomic_load_n(&settings[SETTING_BRAKE_FREQUENCY].value, __ATOMIC_RELAXED) * 100U;
 }
 
 DisplayMotorState displayGetMotorInputState() {
@@ -3357,15 +3497,15 @@ DisplayMotorState displayGetMotorInputState() {
   return DisplayMotorState::Initializing;
 }
 
-void displaySetMotorState(DisplayMotorState state, uint8_t dutyPercent) {
+void displaySetMotorState(DisplayMotorState state, uint16_t dutyPermille) {
   __atomic_store_n(&motorState, state, __ATOMIC_RELEASE);
-  __atomic_store_n(&motorDutyPercent, dutyPercent, __ATOMIC_RELAXED);
+  __atomic_store_n(&motorDutyPermille, dutyPermille, __ATOMIC_RELAXED);
 }
 
 void updateMotorStatusDisplay() {
   if (currentPage == MenuPage::Status && !welcomeVisible &&
       (__atomic_load_n(&motorState, __ATOMIC_ACQUIRE) != displayedMotorState ||
-       __atomic_load_n(&motorDutyPercent, __ATOMIC_RELAXED) != displayedMotorDutyPercent)) {
+       (__atomic_load_n(&motorDutyPermille, __ATOMIC_RELAXED) + 5) / 10 != (displayedMotorDutyPermille + 5) / 10)) {
     drawMotorStatusBadge();
     screen->flush();
   }

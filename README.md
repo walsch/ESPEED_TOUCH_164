@@ -52,6 +52,8 @@ Vier Karten (196x64 px) plus Statusleiste:
 - Motorstatus im Kopf: `NO VIN`, `NO SENSOR`, `CAL REQUIRED`, `RELEASE TRIGGER`, `BRAKE`, `DRIVE` oder `BTN ERROR` zeigt den aktuellen Freigabezustand.
 - Motor: Trigger 0 % bremst mit `BRAKE` nur ueber Lowside; oberhalb des Deadbands wird nur die Highside mit `SENSI` als Startwert und linear bis 100 % getaktet.
 - `EXPO` (-100 ... 100, 0 = linear) formt den Triggerweg vor der Abbildung auf `SENSI` ... 100 % wie die Referenz (Expo-Typ 0, exponentiell): positive Werte geben frueher mehr Gas, negative spaeter.
+- `DRAGB` (0 ... 100 %): Schleppbremse; IN = Gas, INH = Gas + DRAGB, sodass die Lowside in der PWM-Pause bremst. Modus je Fahrzeug ueber die Taste im Kopf des DRAGB-Editors: `DECL` (Standard wie Referenz, nur waehrend der Trigger zurueckgenommen wird) oder `CONT` (immer beim Fahren). Bei `CONT` zeigt die DRAGB-Karte im Settings-Menue eine Markierung `CONT`.
+- `PWM_F` / `BRK_F` (0,2 ... 50 kHz in 0,1-kHz-Schritten, Standard 30 kHz / 0,2 kHz wie Referenz): PWM-Frequenz fuer Fahren bzw. Bremsen. Eine niedrige Bremsfrequenz verringert die Rueckspeisung in Netzteile, die keinen Strom aufnehmen koennen. Die Periode wechselt jeweils am PWM-Periodenende.
 - Die Motorsteuerung laeuft auf allen Seiten; geaenderte Werte wirken sofort. Nur waehrend der Triggerkalibrierung wird mit `BRAKE` gebremst (`CALIBRATING`).
 - Freigabe: VIN muss mindestens 5,5 V betragen, Triggerkalibrierung muss gueltig sein und nach Start/VIN-Ausfall muss zuerst die Bremsposition erkannt werden. Bei VIN-Verlust fordert die Firmware Lowside-Bremse an.
 - Titelzeile: `SETTINGS` oeffnet das Settings-Menu.
