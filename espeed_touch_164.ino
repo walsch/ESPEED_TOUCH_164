@@ -5,6 +5,7 @@
 #include "current_sensor.h"
 #include "back_emf.h"
 #include "motor_resistance.h"
+#include "full_contact.h"
 #include <Arduino.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -24,6 +25,48 @@ constexpr uint32_t BACK_EMF_SETTLE_US = 25;
 
 uint16_t applyExpo(uint16_t permille, int16_t expo) {
 	return static_cast<uint16_t>(expoCurve(permille / 1000.0f, expo) * 1000.0f + 0.5f);
+}
+
+// Reference wire_choke: AWG18 stranded copper, 7 mOhm per ft; current filter 10 ms.
+constexpr uint32_t WIRE_MILLIOHM_PER_FOOT = 7;
+constexpr uint32_t WIRE_CURRENT_TAU_US = 10000;
+
+struct WireChoke {
+	uint32_t lastUs = 0;
+	int32_t filteredMilliAmps256 = 0;
+	// Sub-step remainder in 1e-5 of full scale, carried to the next cycle.
+	int32_t rest = 0;
+};
+
+// Series resistor in the track lead: motor voltage drops by I_motor * R, i.e. duty by I_motor * R / VIN.
+uint16_t applyWireChoke(WireChoke &wire, uint16_t dutyPermille, uint16_t triggerPermille,
+		int32_t motorMilliAmps, uint32_t vinMilliVolts, uint16_t wireTenthFeet, uint8_t limitPercent) {
+	const uint32_t now = micros();
+	const uint32_t dt = wire.lastUs == 0 ? WIRE_CURRENT_TAU_US : now - wire.lastUs;
+	wire.lastUs = now;
+	const int32_t current256 = max<int32_t>(0, motorMilliAmps) * 256;
+	if (dt >= WIRE_CURRENT_TAU_US) {
+		wire.filteredMilliAmps256 = current256;
+	} else {
+		wire.filteredMilliAmps256 += (int32_t)(((int64_t)(current256 - wire.filteredMilliAmps256) * (int32_t)dt) /
+			WIRE_CURRENT_TAU_US);
+	}
+	if (wireTenthFeet == 0 || dutyPermille == 0 || vinMilliVolts == 0 ||
+		triggerPermille > limitPercent * 10U) {
+		wire.rest = 0;
+		return dutyPermille;
+	}
+	const int64_t milliAmps = (wire.filteredMilliAmps256 + 128) / 256;
+	const int32_t choke = (int32_t)((milliAmps * wireTenthFeet * WIRE_MILLIOHM_PER_FOOT * 10 + vinMilliVolts / 2) /
+		vinMilliVolts);
+	const int32_t out = (int32_t)dutyPermille * 100 - choke + wire.rest;
+	if (out <= 0) {
+		wire.rest = 0;
+		return 0;
+	}
+	const int32_t quotient = out / 100;
+	wire.rest = out - quotient * 100;
+	return min<int32_t>(quotient, dutyPermille);
 }
 
 void displayTask(void *parameter) {
@@ -49,6 +92,7 @@ void vehicleControlTask(void *parameter) {
 	bool motorArmed = false;
 	uint16_t previousTriggerPermille = 0;
 	bool decelerating = false;
+	WireChoke wireChoke;
 	bool driving = false;
 	uint32_t standingSince = 0;
 	uint32_t vinPresentSince = 0;
@@ -99,7 +143,9 @@ void vehicleControlTask(void *parameter) {
 				currentZeroPending = true;
 				currentZeroTries = 0;
 			}
-			btn9990SetSupplyAvailable(trackSupplyAvailable, brakePercent);
+			if (trackSupplyAvailable || fullContactLowSideAllowed()) {
+				btn9990SetSupplyAvailable(trackSupplyAvailable, brakePercent);
+			}
 			previousTrackSupplyAvailable = trackSupplyAvailable;
 		}
 
@@ -110,26 +156,65 @@ void vehicleControlTask(void *parameter) {
 		btn9990SetFrequencies(driveFrequencyHz, brakeFrequencyHz);
 		uint16_t commandedDutyPermille = 0;
 		uint8_t testDutyPercent = 0;
-		if (motorResistanceUpdate(trackSupplyAvailable, displayTrackVoltageMilliVolts(), &testDutyPercent)) {
+		const uint8_t bypassMode = displayGetBypassMode();
+		const bool fullContactEnabled = bypassMode == 2;
+		const uint32_t vinMilliVolts = displayTrackVoltageMilliVolts();
+		// The contact must be open before the bridge brakes.
+		auto openFullContact = [&]() { fullContactUpdate(fullContactEnabled, false, false, vinMilliVolts); };
+		// Bridge off (motor coasts) until the contact has had time to open.
+		auto applyBrake = [&]() -> bool {
+			if (!fullContactLowSideAllowed()) {
+				btn9990Disable();
+				return true;
+			}
+			return btn9990SetBrakeDuty(brakePercent);
+		};
+		if (motorResistanceUpdate(trackSupplyAvailable, vinMilliVolts, &testDutyPercent)) {
+			openFullContact();
 			motorArmed = false;
 			motorState = DisplayMotorState::Driving;
 			commandedDutyPermille = testDutyPercent * 10U;
 		} else if (!controlInputValid) {
+			openFullContact();
 			motorArmed = false;
-			outputAccepted = btn9990SetBrakeDuty(brakePercent);
+			outputAccepted = applyBrake();
 			commandedDutyPermille = brakePercent * 10U;
 		} else if (triggerPermille == 0) {
+			openFullContact();
 			motorArmed = true;
-			outputAccepted = btn9990SetBrakeDuty(brakePercent);
+			outputAccepted = applyBrake();
 			commandedDutyPermille = brakePercent * 10U;
 		} else if (!motorArmed) {
-			outputAccepted = btn9990SetBrakeDuty(brakePercent);
+			openFullContact();
+			outputAccepted = applyBrake();
 			commandedDutyPermille = brakePercent * 10U;
 		} else {
 			const uint16_t curvedPermille = applyExpo(triggerPermille, displayGetExpo());
 			const uint16_t sensiPermille = sensiPercent * 10U;
-			const uint16_t throttlePermille = sensiPermille +
+			uint16_t curvedThrottlePermille = sensiPermille +
 				((1000U - sensiPermille) * curvedPermille + 500U) / 1000U;
+			const bool triggerFull = triggerPermille >= 1000;
+			if (bypassMode > 0 && triggerFull) {
+				// BYPAS: everything available at full trigger (no curve, no LIMIT; FULL mode adds the contact).
+				curvedThrottlePermille = 1000;
+			} else {
+				// LIMIT (reference target voltage): mean drive voltage at most LIMIT.
+				const uint32_t limitMilliVolts = displayGetVoltageLimitMilliVolts();
+				if (limitMilliVolts > 0) {
+					if (!trackSupplyAvailable) {
+						curvedThrottlePermille = 0;
+					} else if (limitMilliVolts < vinMilliVolts) {
+						curvedThrottlePermille = (curvedThrottlePermille * limitMilliVolts + vinMilliVolts / 2) / vinMilliVolts;
+					}
+				}
+			}
+			int32_t motorMilliAmps = 0;
+			currentSensorGetMilliAmps(&motorMilliAmps);
+			uint16_t wireTenthFeet;
+			uint8_t wireLimitPercent;
+			displayGetWire(&wireTenthFeet, &wireLimitPercent);
+			const uint16_t throttlePermille = applyWireChoke(wireChoke, curvedThrottlePermille, triggerPermille,
+				motorMilliAmps, vinMilliVolts, wireTenthFeet, wireLimitPercent);
 			// Reference DRAGM DECL: drag only while the trigger is being released.
 			if (triggerPermille >= 1000) {
 				decelerating = false;
@@ -138,12 +223,16 @@ void vehicleControlTask(void *parameter) {
 			} else if (decelerating && triggerPermille >= previousTriggerPermille) {
 				decelerating = false;
 			}
-			const uint16_t dragPermille = decelerating || displayGetDragContinuous()
+			fullContactUpdate(fullContactEnabled, triggerFull, throttlePermille >= 1000, vinMilliVolts);
+			const uint16_t dragPermille = (decelerating || displayGetDragContinuous()) && fullContactLowSideAllowed()
 				? displayGetDragBrake() * 10U : 0;
 			commandedDutyPermille = throttlePermille;
 			if (!btn9990Enable() || !btn9990SetOutput(throttlePermille, dragPermille)) {
-				outputAccepted = btn9990SetBrakeDuty(brakePercent);
+				openFullContact();
+				outputAccepted = applyBrake();
 				commandedDutyPermille = brakePercent * 10U;
+			} else if (fullContactEngaged()) {
+				motorState = DisplayMotorState::DrivingFull;
 			}
 		}
 		previousTriggerPermille = controlInputValid ? triggerPermille : 0;
@@ -160,7 +249,7 @@ void vehicleControlTask(void *parameter) {
 		if (driving || wasDriving) {
 			standingSince = now;
 		}
-		if (now - backEmfSampleAt >= BACK_EMF_SAMPLE_MS) {
+		if (now - backEmfSampleAt >= BACK_EMF_SAMPLE_MS && !fullContactRequested()) {
 			backEmfSampleAt = now;
 			btn9990PauseOutput();
 			delayMicroseconds(BACK_EMF_SETTLE_US);
@@ -195,6 +284,7 @@ void vehicleControlTask(void *parameter) {
 
 void setup() {
 	btn9990Begin();
+	fullContactBegin();
 	currentSensorBegin();
 	backEmfBegin();
 	displayInit();

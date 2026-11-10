@@ -8,3 +8,5 @@ void backEmfBegin();
 void backEmfSample(bool standing);
 bool backEmfGetMilliVolts(uint16_t *milliVolts);
 bool backEmfOffsetLearned();
+// Instantaneous motor terminal voltage without switching the bridge; false if 0 V.
+bool backEmfReadMotorMilliVolts(uint32_t *milliVolts);

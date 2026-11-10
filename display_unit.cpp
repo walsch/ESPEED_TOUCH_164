@@ -4,6 +4,7 @@
 #include "current_sensor.h"
 #include "back_emf.h"
 #include "motor_resistance.h"
+#include "full_contact.h"
 
 #include <Arduino_GFX_Library.h>
 #define LV_CONF_INCLUDE_SIMPLE
@@ -641,8 +642,10 @@ SettingItem settings[] = {
     {"WLIM", 99, 0, 100, '%'},
     {"CURVE", 50, 10, 90, '%'},
     {"PWM_F", 300, 2, 500, 'k'},
-    {"LIMIT", 100, 5, 100, '%'},
-    {"BYPAS", 0, 0, 1, ' '},
+    // Max drive voltage in 0.1 V, 0 = OFF (reference autoVoltageRegulation).
+    {"LIMIT", 0, 0, 200, 'v'},
+    // Full trigger bypasses curve and LIMIT: 0 = OFF, 1 = BTN at 100 %, 2 = also FULL contact.
+    {"BYPAS", 0, 0, 2, ' '},
     // Brake PWM: a low frequency limits regeneration into supplies that cannot sink current.
     {"BRK_F", 2, 2, 500, 'k'},
 };
@@ -672,6 +675,11 @@ constexpr uint8_t CONFIG_VIN_DIVIDER = 2;
 constexpr uint8_t CONFIG_VOLTAGE_CORRECTION = 3;
 uint8_t selectedConfig = 0;
 bool editingConfig = false;
+// WLIM has no card of its own; it is edited inside the WIRE dialog.
+constexpr uint8_t SETTING_WIRE = 5;
+constexpr uint8_t SETTING_WIRE_LIMIT = 6;
+bool editWireLimit = false;
+int16_t editOriginalWireLimit = 0;
 int16_t savedConfigValues[CONFIG_COUNT];
 int32_t vinCorrectionTargetMilliVolts = 0;
 int32_t displayedVinCorrectionIstMilliVolts = -1;
@@ -699,6 +707,9 @@ int32_t displayedMotorKvTargetRpm = -1;
 uint32_t motorKvDisplayUpdatedAt = 0;
 
 SettingItem &editItem() {
+  if (!editingConfig && editWireLimit) {
+    return settings[SETTING_WIRE_LIMIT];
+  }
   return editingConfig ? configItems[selectedConfig] : settings[selectedSetting];
 }
 
@@ -720,6 +731,8 @@ struct CarBlob {
 // Profiles stored before BRK_F was added (PWM_F was then unused, in kHz).
 constexpr uint8_t LEGACY_SETTING_COUNT = 11;
 constexpr uint8_t SETTING_PWM_FREQUENCY = 8;
+constexpr uint8_t SETTING_VOLTAGE_LIMIT = 9;
+constexpr uint8_t SETTING_BYPASS = 10;
 constexpr uint8_t SETTING_BRAKE_FREQUENCY = 11;
 struct LegacyCarBlob {
   char name[CAR_NAME_LENGTH + 1];
@@ -739,6 +752,7 @@ uint8_t savedSelectedCar = 0;
 uint32_t pendingSaveAt = 0;
 
 bool saveTriggerCalibration(int16_t rest, int16_t travel) {
+  FullContactWriteGuard guard;
   if (!preferencesReady || !triggerCalibrationIsValid(rest, travel)) {
     return false;
   }
@@ -780,6 +794,7 @@ void resetCarToDefaults(uint8_t car) {
 }
 
 void storeMotorData(uint8_t car) {
+  FullContactWriteGuard guard;
   char key[8];
   snprintf(key, sizeof(key), "mr%u", car);
   prefs.putUInt(key, motorResistanceMilliOhms[car]);
@@ -808,6 +823,7 @@ void carKey(uint8_t car, char *key, size_t size) {
 }
 
 void persistProfiles() {
+  FullContactWriteGuard guard;
   storeCurrentCar();
   char key[8];
   for (uint8_t car = 0; car < CAR_COUNT; car++) {
@@ -874,6 +890,26 @@ void initCars() {
     if (!valid || storedLength != sizeof(CarBlob)) {
       prefs.putBytes(key, &savedBlobs[car], sizeof(CarBlob));
     }
+  }
+  // LIMIT was a duty in % before; it is now a voltage, so old values start as OFF.
+  if (!prefs.getBool("limV", false)) {
+    for (uint8_t car = 0; car < CAR_COUNT; car++) {
+      carValues[car][SETTING_VOLTAGE_LIMIT] = 0;
+      fillBlob(car, savedBlobs[car]);
+      carKey(car, key, sizeof(key));
+      prefs.putBytes(key, &savedBlobs[car], sizeof(CarBlob));
+    }
+    prefs.putBool("limV", true);
+  }
+  // BYPAS was a voltage for a short time; it is ON/OFF again, so reset once.
+  if (!prefs.getBool("bypC", false)) {
+    for (uint8_t car = 0; car < CAR_COUNT; car++) {
+      carValues[car][SETTING_BYPASS] = 0;
+      fillBlob(car, savedBlobs[car]);
+      carKey(car, key, sizeof(key));
+      prefs.putBytes(key, &savedBlobs[car], sizeof(CarBlob));
+    }
+    prefs.putBool("bypC", true);
   }
   if (!valid) {
     prefs.putUShort("ver", PROFILE_VERSION);
@@ -1042,13 +1078,14 @@ const char *motorStateLabel(DisplayMotorState state) {
     case DisplayMotorState::Braking: return "BRAKE";
     case DisplayMotorState::Driving: return "DRIVE";
     case DisplayMotorState::DrivingLowVin: return "DRIVE LOW VIN";
+    case DisplayMotorState::DrivingFull: return "FULL";
     case DisplayMotorState::TriggerCalibrating: return "CALIBRATING";
     default: return "INIT";
   }
 }
 
 uint16_t motorStateColor(DisplayMotorState state) {
-  if (state == DisplayMotorState::Driving) {
+  if (state == DisplayMotorState::Driving || state == DisplayMotorState::DrivingFull) {
     return COLOR_ACCENT;
   }
   if (state == DisplayMotorState::DrivingLowVin) {
@@ -1084,13 +1121,31 @@ void drawMotorStatusBadge() {
   displayedMotorDutyPermille = duty;
 }
 
+const char *bypassModeLabel(int16_t mode) {
+  return mode == 2 ? "FULL" : mode == 1 ? "BTN" : "OFF";
+}
+
 void printSettingValue(const SettingItem &item, int16_t x, int16_t y, uint16_t color = COLOR_TEXT);
+
+// Grid position of a setting card, or -1 if it has no card (WLIM lives in the WIRE dialog).
+constexpr uint8_t SETTING_GRID_ORDER[] = {0, 1, 2, 4, 5, 9, 7, 8, 10, 11, 3};
+
+int8_t settingGridSlot(uint8_t index) {
+  for (uint8_t slot = 0; slot < sizeof(SETTING_GRID_ORDER); slot++) {
+    if (SETTING_GRID_ORDER[slot] == index) {
+      return slot;
+    }
+  }
+  return -1;
+}
 
 // Only these settings act on the motor so far; the others are shown grayed out.
 bool settingImplemented(uint8_t index) {
   const char *name = settings[index].name;
   return strcmp(name, "BRAKE") == 0 || strcmp(name, "SENSI") == 0 || strcmp(name, "EXPO") == 0 ||
-         strcmp(name, "DRAGB") == 0 || strcmp(name, "PWM_F") == 0 || strcmp(name, "BRK_F") == 0;
+         strcmp(name, "DRAGB") == 0 || strcmp(name, "PWM_F") == 0 || strcmp(name, "BRK_F") == 0 ||
+         strcmp(name, "WIRE") == 0 || strcmp(name, "WLIM") == 0 || strcmp(name, "LIMIT") == 0 ||
+         strcmp(name, "BYPAS") == 0;
 }
 
 void statusCardRect(uint8_t card, int16_t &x, int16_t &y) {
@@ -1206,7 +1261,8 @@ bool currentElectricalPowerDeciWatts(int32_t *deciWatts) {
     return false;
   }
   const DisplayMotorState state = __atomic_load_n(&motorState, __ATOMIC_ACQUIRE);
-  if (state != DisplayMotorState::Driving && state != DisplayMotorState::DrivingLowVin) {
+  if (state != DisplayMotorState::Driving && state != DisplayMotorState::DrivingLowVin &&
+      state != DisplayMotorState::DrivingFull) {
     *deciWatts = 0;
     return true;
   }
@@ -1315,12 +1371,24 @@ void printSettingValue(const SettingItem &item, int16_t x, int16_t y, uint16_t c
   screen->setTextSize(4);
   screen->setCursor(x, y);
   if (item.name[0] == 'B' && item.name[1] == 'Y') {
-    screen->print(item.value ? "ON" : "OFF");
+    screen->print(bypassModeLabel(item.value));
   } else if (strcmp(item.name, "VINDIV") == 0) {
     screen->print(item.value ? "15K" : "10K");
   } else if (item.unit == 'k') {
     char text[12];
     snprintf(text, sizeof(text), "%d.%dk", item.value / 10, item.value % 10);
+    screen->print(text);
+  } else if (item.unit == 'f') {
+    char text[12];
+    snprintf(text, sizeof(text), "%d.%dft", item.value / 10, item.value % 10);
+    screen->print(text);
+  } else if (item.unit == 'v') {
+    char text[12];
+    if (item.value == 0) {
+      strcpy(text, "OFF");
+    } else {
+      snprintf(text, sizeof(text), "%d.%dV", item.value / 10, item.value % 10);
+    }
     screen->print(text);
   } else {
     screen->print(item.value);
@@ -1374,8 +1442,12 @@ void drawSettingsPage() {
   screen->print(carNames[selectedCar]);
 
   for (uint8_t index = 0; index < sizeof(settings) / sizeof(settings[0]); index++) {
-    const uint8_t column = index / 2;
-    const uint8_t row = index % 2;
+    const int8_t slot = settingGridSlot(index);
+    if (slot < 0) {
+      continue;
+    }
+    const uint8_t column = slot / 2;
+    const uint8_t row = slot % 2;
     const int16_t x = SETTINGS_GRID_LEFT + column * SETTINGS_COLUMN_STEP - settingsScroll;
     const int16_t y = 56 + row * 92;
     if (x < 0 || x + SETTINGS_BUTTON_WIDTH > 456) {
@@ -1397,6 +1469,14 @@ void drawSettingsPage() {
       screen->setCursor(x + 125 - screen->textWidth("CONT") / 2, y + 11);
       screen->print("CONT");
     }
+    if (index == SETTING_WIRE) {
+      char limit[12];
+      snprintf(limit, sizeof(limit), "WLIM %d%%", settings[SETTING_WIRE_LIMIT].value);
+      screen->setTextColor(enabled ? COLOR_LABEL : COLOR_TRACK);
+      screen->setTextSize(1);
+      screen->setCursor(x + SETTINGS_BUTTON_WIDTH - 8 - screen->textWidth(limit), y + 12);
+      screen->print(limit);
+    }
   }
 
   screen->fillRoundRect(14, 240, 428, 34, 8, COLOR_PANEL);
@@ -1411,7 +1491,8 @@ void drawSettingsPage() {
 
 void drawEditPage() {
   const SettingItem &item = editItem();
-  drawHeader(item.name);
+  const bool wireDialog = !editingConfig && selectedSetting == SETTING_WIRE;
+  drawHeader(wireDialog ? settings[SETTING_WIRE].name : item.name);
 
   screen->fillRoundRect(232, 6, 100, 34, 8, COLOR_PANEL);
   screen->drawRoundRect(232, 6, 100, 34, 8, COLOR_DANGER);
@@ -1423,6 +1504,18 @@ void drawEditPage() {
   screen->print("CANCEL");
   screen->setCursor(368, 15);
   screen->print("SAVE");
+
+  if (wireDialog) {
+    // Toggles the sliders between WIRE and WLIM.
+    char limit[12];
+    snprintf(limit, sizeof(limit), "WLIM %d%%", settings[SETTING_WIRE_LIMIT].value);
+    screen->fillRoundRect(112, 6, 112, 34, 8, editWireLimit ? COLOR_ACCENT_WARM : COLOR_PANEL);
+    screen->drawRoundRect(112, 6, 112, 34, 8, COLOR_ACCENT_WARM);
+    screen->setTextColor(editWireLimit ? COLOR_BG : COLOR_TEXT);
+    screen->setTextSize(2);
+    screen->setCursor(168 - screen->textWidth(limit) / 2, 15);
+    screen->print(limit);
+  }
 
   if (strcmp(item.name, "DRAGB") == 0) {
     const bool continuous = dragContinuous[selectedCar];
@@ -1449,10 +1542,13 @@ void drawEditPage() {
   } else {
     char range[32];
     if (isToggle) {
-      snprintf(range, sizeof(range), "OFF - ON");
-    } else if (item.unit == 'k') {
-      snprintf(range, sizeof(range), "%d.%dk - %d.%dk", item.minimum / 10, item.minimum % 10,
-               item.maximum / 10, item.maximum % 10);
+      snprintf(range, sizeof(range), "OFF - BTN - FULL");
+    } else if (item.unit == 'v') {
+      snprintf(range, sizeof(range), "OFF - %d.%dV", item.maximum / 10, item.maximum % 10);
+    } else if (item.unit == 'k' || item.unit == 'f') {
+      const char *unit = item.unit == 'k' ? "k" : "ft";
+      snprintf(range, sizeof(range), "%d.%d%s - %d.%d%s", item.minimum / 10, item.minimum % 10, unit,
+               item.maximum / 10, item.maximum % 10, unit);
     } else if (item.unit != ' ') {
       snprintf(range, sizeof(range), "%d%c - %d%c", item.minimum, item.unit, item.maximum, item.unit);
     } else {
@@ -1465,15 +1561,17 @@ void drawEditPage() {
 
     char value[8];
     if (isToggle) {
-      snprintf(value, sizeof(value), "%s", item.value ? "ON" : "OFF");
-    } else if (item.unit == 'k') {
+      snprintf(value, sizeof(value), "%s", bypassModeLabel(item.value));
+    } else if (item.unit == 'v' && item.value == 0) {
+      snprintf(value, sizeof(value), "OFF");
+    } else if (item.unit == 'k' || item.unit == 'f' || item.unit == 'v') {
       snprintf(value, sizeof(value), "%d.%d", item.value / 10, item.value % 10);
     } else {
       snprintf(value, sizeof(value), "%d", item.value);
     }
     const uint8_t valueSize = 8;
     const uint8_t unitSize = 4;
-    const bool showUnit = !isToggle && item.unit != ' ';
+    const bool showUnit = !isToggle && item.unit != ' ' && !(item.unit == 'v' && item.value == 0);
     const int16_t valueWidth = strlen(value) * 6 * valueSize + (showUnit ? 6 * unitSize : 0);
     const int16_t valueX = (456 - valueWidth) / 2;
     // vertically centered in the area below the range line (80..280)
@@ -1485,7 +1583,13 @@ void drawEditPage() {
     if (showUnit) {
       screen->setTextSize(unitSize);
       screen->setCursor(valueX + strlen(value) * 6 * valueSize, valueY + 8 * valueSize - 8 * unitSize);
-      screen->print(item.unit);
+      if (item.unit == 'f') {
+        screen->print("ft");
+      } else if (item.unit == 'v') {
+        screen->print("V");
+      } else {
+        screen->print(item.unit);
+      }
     }
   }
 
@@ -1529,10 +1633,11 @@ void drawEditPage() {
     screen->print("EXPO CURVE");
     // Duty over trigger as driven: SENSI at first movement, EXPO-shaped up to 100%.
     const float sensi = settings[1].value / 100.0f;
+    const float limit = 1.0f;
     int16_t previousX = graphX;
     int16_t previousY = graphBottom - (int16_t)(sensi * graphHeight);
     for (int16_t point = 2; point <= 100; point += 2) {
-      const float output = sensi + (1.0f - sensi) * expoCurve(point / 100.0f, item.value);
+      const float output = sensi + (limit - sensi) * expoCurve(point / 100.0f, item.value);
       const int16_t currentX = graphX + (point * (graphWidth - 1)) / 100;
       const int16_t currentY = graphBottom - (int16_t)(output * graphHeight);
       screen->drawLine(previousX, previousY, currentX, currentY, COLOR_ACCENT_WARM);
@@ -1852,8 +1957,12 @@ void drawAssignSlotPage() {
   screen->print("BACK");
 
   for (uint8_t index = 0; index < SETTING_COUNT; index++) {
-    const int16_t x = SETTINGS_GRID_LEFT + (index / 2) * SETTINGS_COLUMN_STEP - settingsScroll;
-    const int16_t y = 56 + (index % 2) * 92;
+    const int8_t slot = settingGridSlot(index);
+    if (slot < 0) {
+      continue;
+    }
+    const int16_t x = SETTINGS_GRID_LEFT + (slot / 2) * SETTINGS_COLUMN_STEP - settingsScroll;
+    const int16_t y = 56 + (slot % 2) * 92;
     if (x < 0 || x + SETTINGS_BUTTON_WIDTH > 456) {
       continue;
     }
@@ -2700,8 +2809,12 @@ void handleTouch(int16_t x, int16_t y) {
       return;
     }
     for (uint8_t index = 0; index < SETTING_COUNT; index++) {
-      const int16_t cardX = SETTINGS_GRID_LEFT + (index / 2) * SETTINGS_COLUMN_STEP - settingsScroll;
-      const int16_t cardY = 56 + (index % 2) * 92;
+      const int8_t slot = settingGridSlot(index);
+      if (slot < 0) {
+        continue;
+      }
+      const int16_t cardX = SETTINGS_GRID_LEFT + (slot / 2) * SETTINGS_COLUMN_STEP - settingsScroll;
+      const int16_t cardY = 56 + (slot % 2) * 92;
       if (x >= cardX && x < cardX + SETTINGS_BUTTON_WIDTH &&
           y >= cardY && y < cardY + SETTINGS_BUTTON_HEIGHT) {
         slotSetting[assignSlot] = index;
@@ -2720,14 +2833,20 @@ void handleTouch(int16_t x, int16_t y) {
       openCarMenu(true);
     } else if (y >= 55 && y < 238) {
       for (uint8_t index = 0; index < sizeof(settings) / sizeof(settings[0]); index++) {
-        const int16_t cardX = SETTINGS_GRID_LEFT + (index / 2) * SETTINGS_COLUMN_STEP - settingsScroll;
-        const int16_t cardY = 56 + (index % 2) * 92;
+        const int8_t slot = settingGridSlot(index);
+        if (slot < 0) {
+          continue;
+        }
+        const int16_t cardX = SETTINGS_GRID_LEFT + (slot / 2) * SETTINGS_COLUMN_STEP - settingsScroll;
+        const int16_t cardY = 56 + (slot % 2) * 92;
         if (x >= cardX && x < cardX + SETTINGS_BUTTON_WIDTH &&
             y >= cardY && y < cardY + SETTINGS_BUTTON_HEIGHT) {
           if (!settingImplemented(index)) {
             break;
           }
           selectedSetting = index;
+          editWireLimit = false;
+          editOriginalWireLimit = settings[SETTING_WIRE_LIMIT].value;
           editingConfig = false;
           editOriginalValue = settings[index].value;
           editOriginalDragContinuous = dragContinuous[selectedCar];
@@ -2747,6 +2866,12 @@ void handleTouch(int16_t x, int16_t y) {
   }
 
   if (currentPage == MenuPage::Edit) {
+    if (!editingConfig && selectedSetting == SETTING_WIRE && y < 50 && x >= 112 && x < 224) {
+      editWireLimit = !editWireLimit;
+      sliderRemainder = 0.0f;
+      drawCurrentPage();
+      return;
+    }
     if (!editingConfig && strcmp(editItem().name, "DRAGB") == 0 && y < 50 && x >= 122 && x < 222) {
       dragContinuous[selectedCar] = !dragContinuous[selectedCar];
       drawCurrentPage();
@@ -2761,16 +2886,22 @@ void handleTouch(int16_t x, int16_t y) {
         } else if (dragContinuous[selectedCar] != editOriginalDragContinuous) {
           char key[8];
           snprintf(key, sizeof(key), "dm%u", selectedCar);
+          FullContactWriteGuard guard;
           prefs.putBool(key, dragContinuous[selectedCar]);
         }
       }
       if (cancelTap) {
+        if (!editingConfig && selectedSetting == SETTING_WIRE) {
+          editWireLimit = false;
+          settings[SETTING_WIRE_LIMIT].value = editOriginalWireLimit;
+        }
         editItem().value = editOriginalValue;
         if (strcmp(editItem().name, "CURVE") == 0) {
           curveXValue = curveOriginalX;
           editItem().value = curveOriginalY;
         }
       }
+      editWireLimit = false;
       currentPage = editingConfig ? MenuPage::Config : MenuPage::Settings;
       drawCurrentPage();
     } else if (y >= EDIT_SPLIT_Y) {
@@ -2925,6 +3056,7 @@ void handleTouch(int16_t x, int16_t y) {
         motorKv[selectedCar] = constrain((int32_t)((int64_t)motorKvTargetRpm * 1000 / backEmf), 1L, 65535L);
         char key[8];
         snprintf(key, sizeof(key), "kv%u", selectedCar);
+        FullContactWriteGuard guard;
         prefs.putUShort(key, motorKv[selectedCar]);
         currentPage = MenuPage::CarOptions;
         drawCurrentPage();
@@ -2963,6 +3095,7 @@ void handleTouch(int16_t x, int16_t y) {
         motorResistanceMilliOhms[selectedCar] = milliOhms;
         char key[8];
         snprintf(key, sizeof(key), "mr%u", selectedCar);
+        FullContactWriteGuard guard;
         prefs.putUInt(key, milliOhms);
         currentPage = MenuPage::CarOptions;
         drawCurrentPage();
@@ -3476,6 +3609,19 @@ uint8_t displayGetDragBrake() {
 
 bool displayGetDragContinuous() {
   return __atomic_load_n(&dragContinuous[selectedCar], __ATOMIC_RELAXED);
+}
+
+void displayGetWire(uint16_t *tenthFeet, uint8_t *limitPercent) {
+  *tenthFeet = constrain(__atomic_load_n(&settings[5].value, __ATOMIC_RELAXED), 0, 250);
+  *limitPercent = constrain(__atomic_load_n(&settings[6].value, __ATOMIC_RELAXED), 0, 100);
+}
+
+uint16_t displayGetVoltageLimitMilliVolts() {
+  return constrain(__atomic_load_n(&settings[SETTING_VOLTAGE_LIMIT].value, __ATOMIC_RELAXED), 0, 200) * 100U;
+}
+
+uint8_t displayGetBypassMode() {
+  return constrain(__atomic_load_n(&settings[SETTING_BYPASS].value, __ATOMIC_RELAXED), 0, 2);
 }
 
 void displayGetPwmFrequencies(uint32_t *driveHz, uint32_t *brakeHz) {

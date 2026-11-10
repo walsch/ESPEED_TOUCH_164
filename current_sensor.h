@@ -15,6 +15,8 @@ void currentSensorRejectZero();
 
 // Any task.
 bool currentSensorGetMilliAmps(int32_t *averageMilliAmps);
+// Last single sample (no averaging), for fast protection.
+bool currentSensorGetLatestMilliAmps(int32_t *milliAmps);
 bool currentSensorGetRawMilliVolts(uint16_t *milliVolts);
 uint16_t currentSensorGetOffsetMilliVolts();
 bool currentSensorOffsetMeasured();

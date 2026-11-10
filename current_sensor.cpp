@@ -2,6 +2,7 @@
 
 #include <Arduino.h>
 #include <Preferences.h>
+#include "full_contact.h"
 
 namespace {
 constexpr uint8_t CURRENT_SENSE_PIN = 1;
@@ -20,6 +21,7 @@ bool offsetMeasured = false;
 int32_t gain = GAIN_NOMINAL;
 uint16_t rawMilliVolts = 0;
 int32_t averageMilliAmps = 0;
+int32_t latestMilliAmps = 0;
 bool sampleValid = false;
 bool zeroRequested = false;
 uint8_t zeroResult = 0;
@@ -45,6 +47,7 @@ void currentSensorUpdate() {
   }
   const int32_t deltaMilliVolts = (int32_t)milliVolts - __atomic_load_n(&offsetMilliVolts, __ATOMIC_RELAXED);
   const int32_t milliAmps = (int32_t)(((int64_t)deltaMilliVolts * __atomic_load_n(&gain, __ATOMIC_RELAXED)) / 1000);
+  __atomic_store_n(&latestMilliAmps, milliAmps, __ATOMIC_RELAXED);
   // ~16 ms time constant at 1 ms cycle, as in the reference.
   int32_t average = __atomic_load_n(&averageMilliAmps, __ATOMIC_RELAXED);
   average += (milliAmps - average) / 16;
@@ -90,6 +93,14 @@ bool currentSensorGetMilliAmps(int32_t *milliAmps) {
   return true;
 }
 
+bool currentSensorGetLatestMilliAmps(int32_t *milliAmps) {
+  if (!milliAmps || !__atomic_load_n(&sampleValid, __ATOMIC_ACQUIRE)) {
+    return false;
+  }
+  *milliAmps = __atomic_load_n(&latestMilliAmps, __ATOMIC_RELAXED);
+  return true;
+}
+
 bool currentSensorGetRawMilliVolts(uint16_t *milliVolts) {
   if (!milliVolts) {
     return false;
@@ -129,6 +140,7 @@ bool currentSensorCalibrateGain(int32_t targetMilliAmps) {
   const int64_t scaled = (int64_t)currentSensorGetGain() * targetMilliAmps / measured;
   const int32_t newGain = constrain(scaled, (int64_t)CURRENT_GAIN_MIN, (int64_t)CURRENT_GAIN_MAX);
   __atomic_store_n(&gain, newGain, __ATOMIC_RELAXED);
+  FullContactWriteGuard guard;
   Preferences prefs;
   if (!prefs.begin(PREFS_NAMESPACE, false)) {
     return false;

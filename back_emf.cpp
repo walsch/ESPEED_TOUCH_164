@@ -74,3 +74,9 @@ bool backEmfGetMilliVolts(uint16_t *milliVolts) {
 bool backEmfOffsetLearned() {
   return __atomic_load_n(&offsetLearned, __ATOMIC_ACQUIRE);
 }
+
+bool backEmfReadMotorMilliVolts(uint32_t *milliVolts) {
+  const uint32_t pinMilliVolts = analogReadMilliVolts(MOTOR_VOLTAGE_PIN);
+  *milliVolts = pinMilliVolts * (DIVIDER_LOWER_OHMS + DIVIDER_UPPER_OHMS) / DIVIDER_LOWER_OHMS;
+  return pinMilliVolts > 0;
+}
