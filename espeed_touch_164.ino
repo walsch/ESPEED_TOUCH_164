@@ -21,6 +21,9 @@ constexpr uint32_t CURRENT_ZERO_STANDING_MS = 1000;
 constexpr uint32_t CURRENT_ZERO_RETRY_MS = 2000;
 constexpr uint8_t CURRENT_ZERO_TRIES = 5;
 constexpr uint32_t BACK_EMF_SAMPLE_MS = 10;
+constexpr uint32_t BRAKE_RELEASE_SAMPLE_MS = 2;
+// Below this the motor is considered stopped; fast sampling would only weaken the brake.
+constexpr uint16_t BRAKE_RELEASE_TURNING_MV = 200;
 // EMF observer for BIPOL: U = D * VIN - I * R_A every cycle, offset corrected by each BEMF sample.
 constexpr float EMF_CORRECTION_GAIN = 0.3f;
 
@@ -91,6 +94,50 @@ uint16_t applyWireChoke(WireChoke &wire, uint16_t dutyPermille, uint16_t trigger
 	return min<int32_t>(quotient, dutyPermille);
 }
 
+// TORQ: PI on motor current, gains normalised by the plant gain VIN / R_A (A per unit duty).
+constexpr float TORQUE_KP = 0.3f;
+constexpr float TORQUE_KI_PER_S = 100.0f;
+// Smooths PWM ripple of the single latest current sample.
+constexpr float TORQUE_CURRENT_TAU_S = 0.001f;
+constexpr float TORQUE_INTEGRAL_LIMIT = 0.5f;
+
+struct TorqueControl {
+	uint32_t lastUs = 0;
+	float amps = 0.0f;
+	float integral = 0.0f;
+};
+
+// Feedforward U = EMF + I* * R_A, PI corrects the remaining error; maxPermille is the voltage cap.
+uint16_t torqueDutyPermille(TorqueControl &torque, uint32_t targetMilliAmps, float emfVolts,
+		float motorOhms, uint32_t vinMilliVolts, uint16_t maxPermille) {
+	int32_t latestMilliAmps = 0;
+	if (vinMilliVolts == 0 || !currentSensorGetLatestMilliAmps(&latestMilliAmps)) {
+		return 0;
+	}
+	const uint32_t now = micros();
+	const float dt = torque.lastUs == 0 ? 0.0f : min((now - torque.lastUs) / 1e6f, 0.01f);
+	if (torque.lastUs == 0) {
+		torque.amps = latestMilliAmps / 1000.0f;
+	}
+	torque.lastUs = now;
+	torque.amps += (latestMilliAmps / 1000.0f - torque.amps) * dt / (TORQUE_CURRENT_TAU_S + dt);
+
+	const float vin = vinMilliVolts / 1000.0f;
+	const float target = targetMilliAmps / 1000.0f;
+	const float scale = motorOhms / vin;
+	const float error = (target - torque.amps) * scale;
+	const float feedforward = (emfVolts + target * motorOhms) / vin;
+	const float maxDuty = maxPermille / 1000.0f;
+	const float integral = constrain(torque.integral + TORQUE_KI_PER_S * error * dt,
+		-TORQUE_INTEGRAL_LIMIT, TORQUE_INTEGRAL_LIMIT);
+	const float duty = feedforward + TORQUE_KP * error + integral;
+	// Anti-windup: only integrate while the output is not saturated in that direction.
+	if (!(duty > maxDuty && error > 0.0f) && !(duty < 0.0f && error < 0.0f)) {
+		torque.integral = integral;
+	}
+	return static_cast<uint16_t>(constrain(duty, 0.0f, maxDuty) * 1000.0f + 0.5f);
+}
+
 void displayTask(void *parameter) {
 	(void)parameter;
 	TickType_t lastWakeTime = xTaskGetTickCount();
@@ -137,6 +184,7 @@ void vehicleControlTask(void *parameter) {
 	uint32_t previousTriggerSample = 0;
 	bool decelerating = false;
 	WireChoke wireChoke;
+	TorqueControl torque;
 	bool driving = false;
 	uint32_t standingSince = 0;
 	uint32_t vinPresentSince = 0;
@@ -160,6 +208,13 @@ void vehicleControlTask(void *parameter) {
 		uint8_t brakePercent = 100;
 		const bool controlInputValid = sensorInitialized &&
 			displayGetMotorControl(&triggerPermille, &sensiPercent, &brakePercent);
+		const uint16_t brakeReleaseMilliVolts = displayGetBrakeReleaseMilliVolts();
+		if (brakeReleaseMilliVolts > 0) {
+			// Reference BRKRL: full brake while the motor turns, coast once slow; full until the BEMF zero is learned.
+			uint16_t emfMilliVolts = 0;
+			brakePercent = !backEmfOffsetLearned() || !backEmfGetMilliVolts(&emfMilliVolts) ||
+				emfMilliVolts > brakeReleaseMilliVolts ? 100 : 0;
+		}
 		const uint32_t triggerSample = triggerSensorSampleCount();
 		const bool newTriggerSample = triggerSample != previousTriggerSample;
 		DisplayMotorState motorState = DisplayMotorState::Initializing;
@@ -258,10 +313,15 @@ void vehicleControlTask(void *parameter) {
 			} else {
 				bipolarMotorOhms = 0.0f;
 			}
-			if (bypassMode > 0 && triggerFull) {
+			uint32_t torqueMaxMilliAmps = 0;
+			float torqueMotorOhms = 0.0f;
+			const bool bypassFull = bypassMode > 0 && triggerFull;
+			const bool torqueActive = !bipolarActive && !bypassFull &&
+				displayGetTorque(&torqueMaxMilliAmps, &torqueMotorOhms);
+			if (bypassFull) {
 				// BYPAS: everything available at full trigger (no curve, no LIMIT; FULL mode adds the contact).
 				curvedThrottlePermille = 1000;
-			} else if (!bipolarActive) {
+			} else if (!bipolarActive && !torqueActive) {
 				// LIMIT (reference target voltage): mean drive voltage at most LIMIT.
 				if (limitMilliVolts > 0) {
 					if (!trackSupplyAvailable) {
@@ -276,8 +336,24 @@ void vehicleControlTask(void *parameter) {
 			uint16_t wireTenthFeet;
 			uint8_t wireLimitPercent;
 			displayGetWire(&wireTenthFeet, &wireLimitPercent);
-			const uint16_t throttlePermille = applyWireChoke(wireChoke, curvedThrottlePermille, triggerPermille,
-				motorMilliAmps, vinMilliVolts, wireTenthFeet, wireLimitPercent);
+			uint16_t throttlePermille;
+			if (torqueActive) {
+				uint16_t maxPermille = 1000;
+				if (limitMilliVolts > 0 && limitMilliVolts < vinMilliVolts) {
+					maxPermille = (limitMilliVolts * 1000 + vinMilliVolts / 2) / vinMilliVolts;
+				}
+				// A series wire cannot change a controlled current; it only lowers the voltage left for the motor.
+				maxPermille = min(maxPermille, applyWireChoke(wireChoke, 1000, triggerPermille,
+					motorMilliAmps, vinMilliVolts, wireTenthFeet, wireLimitPercent));
+				uint16_t emfMilliVolts = 0;
+				backEmfGetMilliVolts(&emfMilliVolts);
+				throttlePermille = torqueDutyPermille(torque, curvedThrottlePermille * torqueMaxMilliAmps / 1000,
+					emfMilliVolts / 1000.0f, torqueMotorOhms, vinMilliVolts, maxPermille);
+			} else {
+				torque = TorqueControl();
+				throttlePermille = applyWireChoke(wireChoke, curvedThrottlePermille, triggerPermille,
+					motorMilliAmps, vinMilliVolts, wireTenthFeet, wireLimitPercent);
+			}
 			// Reference DRAGM DECL: drag only while the trigger is being released.
 			// Judged per trigger sample, the loop runs faster than the sensor.
 			if (triggerPermille >= 1000) {
@@ -304,6 +380,7 @@ void vehicleControlTask(void *parameter) {
 		lastDrivePermille = btn9990IsOutputEnabled() ? commandedDutyPermille : 0;
 		if (!btn9990IsOutputEnabled()) {
 			decelerating = false;
+			torque = TorqueControl();
 		}
 		if (!outputAccepted) {
 			motorState = DisplayMotorState::DriverError;
@@ -315,7 +392,12 @@ void vehicleControlTask(void *parameter) {
 		if (driving || wasDriving) {
 			standingSince = now;
 		}
-		if (now - backEmfSampleAt >= BACK_EMF_SAMPLE_MS && !fullContactRequested()) {
+		uint16_t lastEmfMilliVolts = 0;
+		// BRKRL decides on the BEMF: sample faster while the motor still turns after release.
+		const uint32_t backEmfPeriodMs = brakeReleaseMilliVolts > 0 && !driving &&
+			backEmfGetMilliVolts(&lastEmfMilliVolts) && lastEmfMilliVolts > BRAKE_RELEASE_TURNING_MV
+			? BRAKE_RELEASE_SAMPLE_MS : BACK_EMF_SAMPLE_MS;
+		if (now - backEmfSampleAt >= backEmfPeriodMs && !fullContactRequested()) {
 			backEmfSampleAt = now;
 			int32_t milliAmpsBefore = 0;
 			currentSensorGetLatestMilliAmps(&milliAmpsBefore);

@@ -32,6 +32,10 @@ void displayGetWire(uint16_t *tenthFeet, uint8_t *limitPercent);
 uint16_t displayGetVoltageLimitMilliVolts();
 // BYPAS at full trigger: 0 = off, 1 = BTN 100 %, 2 = BTN 100 % plus FULL contact.
 uint8_t displayGetBypassMode();
+// BRKRL in mV, 0 = off (normal BRAKE).
+uint16_t displayGetBrakeReleaseMilliVolts();
+// TORQ: motor current at full trigger; false if off, BIPOL is on or MOTOR R is unknown.
+bool displayGetTorque(uint32_t *maxMilliAmps, float *motorOhms);
 
 struct BipolarSettings {
 	float bandOhms;

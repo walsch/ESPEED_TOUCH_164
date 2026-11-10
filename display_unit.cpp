@@ -616,7 +616,7 @@ constexpr int16_t SETTINGS_BUTTON_HEIGHT = 82;
 constexpr int16_t SETTINGS_COLUMN_STEP = 152;
 constexpr int16_t SETTINGS_GRID_LEFT = 2;
 // 11 settings -> 6 columns, 3 visible
-constexpr int16_t SETTINGS_MAX_SCROLL = 3 * SETTINGS_COLUMN_STEP;
+constexpr int16_t SETTINGS_MAX_SCROLL = 4 * SETTINGS_COLUMN_STEP;
 // edit screen: content spans y 50..280 (CANCEL/SAVE in header); upper half relative, lower half absolute
 constexpr int16_t EDIT_SPLIT_Y = 165;
 
@@ -648,6 +648,10 @@ SettingItem settings[] = {
     {"BYPAS", 0, 0, 2, ' '},
     // Brake PWM: a low frequency limits regeneration into supplies that cannot sink current.
     {"BRK_F", 2, 2, 500, 'k'},
+    // Torque control: full trigger = this motor current in 0.1 A, 0 = OFF (voltage control).
+    {"TORQ", 0, 0, 200, 'a'},
+    // Reference BRKRL: full brake until BEMF drops to this voltage (0.1 V), then coast; 0 = OFF (BRAKE).
+    {"BRKRL", 0, 0, 60, 'v'},
 };
 
 char carNames[][CAR_NAME_LENGTH + 1] = {
@@ -735,22 +739,19 @@ int16_t carCurveX[CAR_COUNT];
 int16_t settingDefaults[SETTING_COUNT];
 
 // NVS persistence: one blob per car, written debounced after the last touch
-struct CarBlob {
+template <uint8_t COUNT>
+struct CarBlobOf {
   char name[CAR_NAME_LENGTH + 1];
-  int16_t values[SETTING_COUNT];
+  int16_t values[COUNT];
   int16_t curveX;
 };
-// Profiles stored before BRK_F was added (PWM_F was then unused, in kHz).
-constexpr uint8_t LEGACY_SETTING_COUNT = 11;
+using CarBlob = CarBlobOf<SETTING_COUNT>;
 constexpr uint8_t SETTING_PWM_FREQUENCY = 8;
 constexpr uint8_t SETTING_VOLTAGE_LIMIT = 9;
 constexpr uint8_t SETTING_BYPASS = 10;
 constexpr uint8_t SETTING_BRAKE_FREQUENCY = 11;
-struct LegacyCarBlob {
-  char name[CAR_NAME_LENGTH + 1];
-  int16_t values[LEGACY_SETTING_COUNT];
-  int16_t curveX;
-};
+constexpr uint8_t SETTING_TORQUE = 12;
+constexpr uint8_t SETTING_BRAKE_RELEASE = 13;
 struct TriggerCalibrationBlob {
   int16_t rest;
   int16_t travel;
@@ -837,6 +838,20 @@ void carKey(uint8_t car, char *key, size_t size) {
   snprintf(key, size, "car%02u", car);
 }
 
+// Profiles from before settings were appended; missing values keep their defaults.
+template <uint8_t COUNT>
+bool loadOlderBlob(const char *key, uint8_t car) {
+  CarBlobOf<COUNT> old;
+  if (prefs.getBytesLength(key) != sizeof(old) || prefs.getBytes(key, &old, sizeof(old)) != sizeof(old)) {
+    return false;
+  }
+  old.name[CAR_NAME_LENGTH] = '\0';
+  strcpy(carNames[car], old.name);
+  memcpy(carValues[car], old.values, sizeof(old.values));
+  carCurveX[car] = old.curveX;
+  return true;
+}
+
 void persistProfiles() {
   FullContactWriteGuard guard;
   storeCurrentCar();
@@ -891,15 +906,11 @@ void initCars() {
       strcpy(carNames[car], blob.name);
       memcpy(carValues[car], blob.values, sizeof(blob.values));
       carCurveX[car] = blob.curveX;
-    } else if (storedLength == sizeof(LegacyCarBlob)) {
-      LegacyCarBlob legacy;
-      if (prefs.getBytes(key, &legacy, sizeof(legacy)) == sizeof(legacy)) {
-        legacy.name[CAR_NAME_LENGTH] = '\0';
-        strcpy(carNames[car], legacy.name);
-        memcpy(carValues[car], legacy.values, sizeof(legacy.values));
-        carValues[car][SETTING_PWM_FREQUENCY] = settingDefaults[SETTING_PWM_FREQUENCY];
-        carCurveX[car] = legacy.curveX;
-      }
+    } else if (valid && loadOlderBlob<11>(key, car)) {
+      // Before BRK_F, PWM_F was unused and in kHz.
+      carValues[car][SETTING_PWM_FREQUENCY] = settingDefaults[SETTING_PWM_FREQUENCY];
+    } else if (valid && !loadOlderBlob<12>(key, car)) {
+      loadOlderBlob<13>(key, car);
     }
     fillBlob(car, savedBlobs[car]);
     if (!valid || storedLength != sizeof(CarBlob)) {
@@ -1147,7 +1158,7 @@ const char *bypassModeLabel(int16_t mode) {
 void printSettingValue(const SettingItem &item, int16_t x, int16_t y, uint16_t color = COLOR_TEXT);
 
 // Grid position of a setting card, or -1 if it has no card (WLIM lives in the WIRE dialog).
-constexpr uint8_t SETTING_GRID_ORDER[] = {0, 1, 2, 4, 5, 9, 7, 8, 10, 11, 3};
+constexpr uint8_t SETTING_GRID_ORDER[] = {0, 13, 1, 2, 4, 5, 9, 12, 7, 8, 10, 11, 3};
 // The BIPOL card follows the setting cards; it opens its own dialog.
 constexpr uint8_t BIPOL_SLOT = sizeof(SETTING_GRID_ORDER);
 
@@ -1166,7 +1177,7 @@ bool settingImplemented(uint8_t index) {
   return strcmp(name, "BRAKE") == 0 || strcmp(name, "SENSI") == 0 || strcmp(name, "EXPO") == 0 ||
          strcmp(name, "DRAGB") == 0 || strcmp(name, "PWM_F") == 0 || strcmp(name, "BRK_F") == 0 ||
          strcmp(name, "WIRE") == 0 || strcmp(name, "WLIM") == 0 || strcmp(name, "LIMIT") == 0 ||
-         strcmp(name, "BYPAS") == 0;
+         strcmp(name, "BYPAS") == 0 || strcmp(name, "TORQ") == 0 || strcmp(name, "BRKRL") == 0;
 }
 
 void statusCardRect(uint8_t card, int16_t &x, int16_t &y) {
@@ -1403,12 +1414,12 @@ void printSettingValue(const SettingItem &item, int16_t x, int16_t y, uint16_t c
     char text[12];
     snprintf(text, sizeof(text), "%d.%dft", item.value / 10, item.value % 10);
     screen->print(text);
-  } else if (item.unit == 'v') {
+  } else if (item.unit == 'v' || item.unit == 'a') {
     char text[12];
     if (item.value == 0) {
       strcpy(text, "OFF");
     } else {
-      snprintf(text, sizeof(text), "%d.%dV", item.value / 10, item.value % 10);
+      snprintf(text, sizeof(text), "%d.%d%c", item.value / 10, item.value % 10, item.unit == 'v' ? 'V' : 'A');
     }
     screen->print(text);
   } else {
@@ -1497,6 +1508,23 @@ void drawSettingsPage() {
       screen->setTextSize(1);
       screen->setCursor(x + SETTINGS_BUTTON_WIDTH - 8 - screen->textWidth(limit), y + 12);
       screen->print(limit);
+    }
+    if (index == 0 && settings[SETTING_BRAKE_RELEASE].value > 0) {
+      screen->setTextColor(COLOR_ACCENT_WARM);
+      screen->setTextSize(1);
+      screen->setCursor(x + SETTINGS_BUTTON_WIDTH - 8 - screen->textWidth("BRKRL"), y + 12);
+      screen->print("BRKRL");
+    }
+    if (index == SETTING_TORQUE && settings[index].value > 0) {
+      const char *note = motorResistanceMilliOhms[selectedCar] == 0 ? "NEED R"
+                         : bipolar[selectedCar].enabled             ? "BIPOL"
+                                                                    : nullptr;
+      if (note) {
+        screen->setTextColor(COLOR_DANGER);
+        screen->setTextSize(1);
+        screen->setCursor(x + SETTINGS_BUTTON_WIDTH - 8 - screen->textWidth(note), y + 12);
+        screen->print(note);
+      }
     }
   }
 
@@ -1589,8 +1617,9 @@ void drawEditPage() {
     char range[32];
     if (isToggle) {
       snprintf(range, sizeof(range), "OFF - BTN - FULL");
-    } else if (item.unit == 'v') {
-      snprintf(range, sizeof(range), "OFF - %d.%dV", item.maximum / 10, item.maximum % 10);
+    } else if (item.unit == 'v' || item.unit == 'a') {
+      snprintf(range, sizeof(range), "OFF - %d.%d%c", item.maximum / 10, item.maximum % 10,
+               item.unit == 'v' ? 'V' : 'A');
     } else if (item.unit == 'k' || item.unit == 'f') {
       const char *unit = item.unit == 'k' ? "k" : "ft";
       snprintf(range, sizeof(range), "%d.%d%s - %d.%d%s", item.minimum / 10, item.minimum % 10, unit,
@@ -1605,19 +1634,20 @@ void drawEditPage() {
     screen->setCursor((456 - (int16_t)strlen(range) * 18) / 2, 56);
     screen->print(range);
 
+    const bool offValue = (item.unit == 'v' || item.unit == 'a') && item.value == 0;
     char value[8];
     if (isToggle) {
       snprintf(value, sizeof(value), "%s", bypassModeLabel(item.value));
-    } else if (item.unit == 'v' && item.value == 0) {
+    } else if (offValue) {
       snprintf(value, sizeof(value), "OFF");
-    } else if (item.unit == 'k' || item.unit == 'f' || item.unit == 'v') {
+    } else if (item.unit == 'k' || item.unit == 'f' || item.unit == 'v' || item.unit == 'a') {
       snprintf(value, sizeof(value), "%d.%d", item.value / 10, item.value % 10);
     } else {
       snprintf(value, sizeof(value), "%d", item.value);
     }
     const uint8_t valueSize = 8;
     const uint8_t unitSize = 4;
-    const bool showUnit = !isToggle && item.unit != ' ' && !(item.unit == 'v' && item.value == 0);
+    const bool showUnit = !isToggle && item.unit != ' ' && !offValue;
     const int16_t valueWidth = strlen(value) * 6 * valueSize + (showUnit ? 6 * unitSize : 0);
     const int16_t valueX = (456 - valueWidth) / 2;
     // vertically centered in the area below the range line (80..280)
@@ -1633,6 +1663,8 @@ void drawEditPage() {
         screen->print("ft");
       } else if (item.unit == 'v') {
         screen->print("V");
+      } else if (item.unit == 'a') {
+        screen->print("A");
       } else {
         screen->print(item.unit);
       }
@@ -3788,6 +3820,21 @@ uint16_t displayGetVoltageLimitMilliVolts() {
 
 uint8_t displayGetBypassMode() {
   return constrain(__atomic_load_n(&settings[SETTING_BYPASS].value, __ATOMIC_RELAXED), 0, 2);
+}
+
+uint16_t displayGetBrakeReleaseMilliVolts() {
+  return constrain(__atomic_load_n(&settings[SETTING_BRAKE_RELEASE].value, __ATOMIC_RELAXED), 0, 60) * 100U;
+}
+
+bool displayGetTorque(uint32_t *maxMilliAmps, float *motorOhms) {
+  const int16_t tenthAmps = constrain(__atomic_load_n(&settings[SETTING_TORQUE].value, __ATOMIC_RELAXED), 0, 200);
+  const uint32_t motorMilliOhms = motorResistanceMilliOhms[selectedCar];
+  if (tenthAmps == 0 || motorMilliOhms == 0 || bipolar[selectedCar].enabled) {
+    return false;
+  }
+  *maxMilliAmps = tenthAmps * 100U;
+  *motorOhms = motorMilliOhms / 1000.0f;
+  return true;
 }
 
 bool displayGetBipolar(BipolarSettings *out) {
