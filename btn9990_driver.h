@@ -6,7 +6,6 @@
 bool btn9990Begin();
 bool btn9990Enable();
 void btn9990Disable();
-bool btn9990SetBrake();
 bool btn9990SetBrakeDuty(uint8_t brakePercent);
 void btn9990SetSupplyAvailable(bool available, uint8_t brakePercent);
 // Duties in 0.1 % (0 ... 1000); IN = throttle, INH = throttle + drag.

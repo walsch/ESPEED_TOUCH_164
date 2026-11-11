@@ -1,3 +1,6 @@
 {
-  "C_Cpp.intelliSenseEngine": "default"
+  "C_Cpp.intelliSenseEngine": "default",
+  "chat.tools.terminal.autoApprove": {
+    "arduino-cli": true
+  }
 }

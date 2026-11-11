@@ -24,8 +24,6 @@ bool timerEnabled = false;
 bool timerRunning = false;
 bool driverReady = false;
 bool outputEnabled = false;
-bool brakeActive = false;
-uint8_t activeBrakeDuty = 100;
 // Applied duties in 0.1 % (0 ... 1000).
 uint16_t appliedInputDuty = 0;
 uint16_t appliedInhibitDuty = 0;
@@ -163,7 +161,6 @@ bool btn9990Begin() {
 
   forcePinsLow();
 
-
   mcpwm_timer_config_t timerConfig = {
       .group_id = 0,
       .clk_src = MCPWM_TIMER_CLK_SRC_DEFAULT,
@@ -240,16 +237,12 @@ bool btn9990Enable() {
   if (!driverReady) {
     return false;
   }
-  if (!outputEnabled) {
-    outputEnabled = true;
-    brakeActive = false;
-  }
+  outputEnabled = true;
   return true;
 }
 
 void btn9990Disable() {
   outputEnabled = false;
-  brakeActive = false;
   if (driverReady) {
     appliedInputDuty = 0;
     appliedInhibitDuty = 0;
@@ -260,21 +253,15 @@ void btn9990Disable() {
   }
 }
 
-bool btn9990SetBrake() {
-  return btn9990SetBrakeDuty(100);
-}
-
 bool btn9990SetBrakeDuty(uint8_t brakePercent) {
   outputEnabled = false;
   if (!driverReady) {
     forcePinsLow();
-    brakeActive = false;
     return false;
   }
   if (brakePercent > 100) {
     brakePercent = 100;
   }
-  activeBrakeDuty = brakePercent;
   applyFrequency(brakeFrequencyHz);
   const uint16_t inhibitDuty = static_cast<uint16_t>(brakePercent) * 10U;
   if (!setGeneratorDuty(inputGenerator, inputComparator, 0) ||
@@ -282,7 +269,6 @@ bool btn9990SetBrakeDuty(uint8_t brakePercent) {
     btn9990Disable();
     return false;
   }
-  brakeActive = brakePercent > 0;
   return true;
 }
 
@@ -293,10 +279,7 @@ void btn9990SetSupplyAvailable(bool available, uint8_t brakePercent) {
 }
 
 bool btn9990SetOutput(uint16_t throttlePermille, uint16_t dragPermille) {
-  if (!driverReady) {
-    return false;
-  }
-  if (!outputEnabled) {
+  if (!driverReady || !outputEnabled) {
     return false;
   }
   if (throttlePermille > 1000 || dragPermille > 1000) {
@@ -311,7 +294,6 @@ bool btn9990SetOutput(uint16_t throttlePermille, uint16_t dragPermille) {
     btn9990SetBrakeDuty(100);
     return false;
   }
-  brakeActive = false;
   return true;
 }
 
